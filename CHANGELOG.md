@@ -10,13 +10,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `agentctl init`: one-command project setup — registers detected platform
-  worktrees into `.agent/config/platforms.json` (leaving `test_command` /
-  `aliases` for manual refinement) and appends the `.agent/tasks/` /
-  `.agent/state/` exclusions to `.gitignore`. Idempotent: existing config is
+  worktrees into `.agents/config/platforms.json` (leaving `test_command` /
+  `aliases` for manual refinement) and appends the `.agents/tasks/` /
+  `.agents/state/` exclusions to `.gitignore`. Idempotent: existing config is
   never overwritten. When no platform worktrees exist yet, prints the exact
   `git worktree add` command to bootstrap the integration boundary.
 - `doctor` now checks the runtime-state `.gitignore` entries
   (`Runtime state gitignore`), completing the init/doctor pair.
+
+### Changed
+
+- **Breaking:** the state and config directory is renamed `.agent/` →
+  `.agents/` (project config, task registry, runtime state, and the
+  per-worktree `TASK.md`). Migrating an existing project: `mv .agent .agents`;
+  move `.agent/TASK.md` → `.agents/TASK.md` inside every task worktree; update
+  `.gitignore`, `.git/info/exclude`, and doc references. No dual-path
+  fallback — the old name is not read.
+
+### Fixed
+
+- e2e fixture on macOS: the mktemp path is now resolved through `pwd -P`.
+  macOS `TMPDIR` sits behind the `/var` → `/private/var` symlink, so the
+  fixture's expectations diverged from the CLI's realpath-normalized output
+  and three path assertions failed (`doctor` text, `doctor --json` root,
+  `platform list --json` worktree_root) on the macOS CI matrix.
 
 ## [0.0.1] - 2026-09-19
 
@@ -30,7 +47,7 @@ Initial public development release.
   `../<repo>-agent-worktrees/<platform>/<task-id>` by default).
 - Task registry with a nine-state lifecycle
   (`created / active / ready / blocked / conflict / integrating / merged / failed / cancelled`),
-  persisted as `.agent/tasks/<id>.json` (schema version 1), mutated under a
+  persisted as `.agents/tasks/<id>.json` (schema version 1), mutated under a
   mkdir mutex with atomic-rename writes (safe for concurrent `task create` /
   `task finish`).
 - Scope write-set enforcement: `--allowed-paths` globs per task; `task check`
@@ -52,13 +69,13 @@ Initial public development release.
   Same conflict-continuation semantics as `integrate`; a `ready` task whose
   base moved returns to `active` so its gates re-run.
 - `task adopt`: rebuilds a lost registry record from a task worktree's
-  `.agent/TASK.md` and task branch (merge-base), recovering orphaned tasks;
+  `.agents/TASK.md` and task branch (merge-base), recovering orphaned tasks;
   `doctor` lists registered-branch orphans.
 - `task remove` reclamation that follows reality: a task whose branch was
   merged by hand outside agentctl is detected as merged and reclaimed without
   `--force`.
 - Coordinator / Worker mode detection via `task current` and a per-worktree
-  `.agent/TASK.md` context file (kept out of commits through `.git/info/exclude`).
+  `.agents/TASK.md` context file (kept out of commits through `.git/info/exclude`).
 - AgentRunner with verified-flag built-in launch templates (`omp`, `opencode`)
   and project-declared templates (`agents.json`) — never guesses unverified flags;
   degrades to printing the manual launch command.

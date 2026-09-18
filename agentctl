@@ -10,13 +10,13 @@
 //   Agent 任务 worktree（Task Worktree，一条任务一个）
 //       ../<repo>-agent-worktrees/<platform>/<task-id> @ agent/<agent>/<task-id>
 //       —— 单个 Agent 的独立开发工作区，物理文件隔离由 git worktree 提供，
-//          内含 .agent/TASK.md 作为当前任务上下文（由 .git/info/exclude 排除，不进业务提交）。
+//          内含 .agents/TASK.md 作为当前任务上下文（由 .git/info/exclude 排除，不进业务提交）。
 //
 // 状态：
-//   .agent/config/platforms.json   平台 registry（入库；缺省时按 git worktree 自动探测）
-//   .agent/config/agents.json      Agent runner 命令模板（可选，用于未内置实测参数的 CLI）
-//   .agent/tasks/<task-id>.json    任务元数据（运行时状态，不入库）
-//   .agent/state/                  运行时临时产物与注册表锁（不入库）
+//   .agents/config/platforms.json   平台 registry（入库；缺省时按 git worktree 自动探测）
+//   .agents/config/agents.json      Agent runner 命令模板（可选，用于未内置实测参数的 CLI）
+//   .agents/tasks/<task-id>.json    任务元数据（运行时状态，不入库）
+//   .agents/state/                  运行时临时产物与注册表锁（不入库）
 //
 // 依赖：node ≥ 20、git。无第三方依赖。手册：README.md
 
@@ -125,8 +125,8 @@ let TASKS_DIR = '';
 let STATE_DIR = '';
 let WORKTREE_ROOT = '';
 let BRANCH_PREFIX = 'agent';
-let CONFIG = {}; // .agent/config/platforms.json
-let AGENT_CONFIG = {}; // .agent/config/agents.json
+let CONFIG = {}; // .agents/config/platforms.json
+let AGENT_CONFIG = {}; // .agents/config/agents.json
 let PLATFORMS_CACHE = null; // 单次调用内缓存平台表（一条命令内不会增删平台 worktree）
 let WORKTREE_ROOT_INSIDE = false; // worktree_root 落在仓库主 checkout 内部时为 true（告警用）
 
@@ -168,7 +168,7 @@ function readJsonConfig(file, label) {
 }
 
 function configInit() {
-  AGENT_DIR = path.join(ROOT, '.agent');
+  AGENT_DIR = path.join(ROOT, '.agents');
   CONFIG_FILE = path.join(AGENT_DIR, 'config', 'platforms.json');
   TASKS_DIR = path.join(AGENT_DIR, 'tasks');
   STATE_DIR = path.join(AGENT_DIR, 'state');
@@ -187,7 +187,7 @@ function configInit() {
 
 // ============================ 平台注册表 ============================
 // 平台 = 长期存在的平台 worktree（主 checkout 与任务 worktree 除外）。
-// 来源：git worktree 自动探测 + .agent/config/platforms.json 声明（声明提供 id 与别名；
+// 来源：git worktree 自动探测 + .agents/config/platforms.json 声明（声明提供 id 与别名；
 // 路径、分支以实际 worktree 为准，不一致即报错，不静默改写）。
 
 function detectPlatforms() {
@@ -304,7 +304,7 @@ function resolvePlatform(name) {
     row = matches[0];
   }
   if (row.state !== 'ok') {
-    die(`平台 ${row.id} 不可用：${row.state}（worktree=${row.worktree} branch=${row.branch}；请先对齐 .agent/config/platforms.json 与实际 worktree）`);
+    die(`平台 ${row.id} 不可用：${row.state}（worktree=${row.worktree} branch=${row.branch}；请先对齐 .agents/config/platforms.json 与实际 worktree）`);
   }
   if (!branchExists(row.branch)) die(`平台分支不存在：${row.branch}`);
   if (!isDir(row.worktree)) die(`平台 worktree 目录不存在：${row.worktree}`);
@@ -681,14 +681,14 @@ function allowedBlock(allowed, indent = '  ') {
 // ============================ TASK.md（任务上下文） ============================
 
 function taskContextPath(worktree) {
-  return path.join(worktree, '.agent', 'TASK.md');
+  return path.join(worktree, '.agents', 'TASK.md');
 }
 
-// .agent/TASK.md 属任务动态上下文：写进 git common dir 的 info/exclude，不进业务提交
+// .agents/TASK.md 属任务动态上下文：写进 git common dir 的 info/exclude，不进业务提交
 function ensureTaskContextExcluded() {
   const infoDir = path.join(gitCommonDir(), 'info');
   const file = path.join(infoDir, 'exclude');
-  const marker = '.agent/TASK.md';
+  const marker = '.agents/TASK.md';
   const current = isFile(file) ? fs.readFileSync(file, 'utf8') : '';
   if (current.split('\n').some((l) => l.trim() === marker)) return;
   fs.mkdirSync(infoDir, { recursive: true });
@@ -767,7 +767,7 @@ function writeTaskContext(task) {
 
 // ============================ AgentRunner ============================
 // 只做「发现 + 构造启动命令 + 启动」，不重新实现任何 agent 自身能力。
-// 内置模板来自本机 CLI 的 --help 实测；未实测的 CLI 必须由 .agent/config/agents.json 声明，
+// 内置模板来自本机 CLI 的 --help 实测；未实测的 CLI 必须由 .agents/config/agents.json 声明，
 // 不猜测参数（猜错会把 agent 引到错误的目录 / 错误的会话）。
 
 const BUILTIN_RUNNERS = {
@@ -786,13 +786,13 @@ const BUILTIN_RUNNERS = {
   codex: {
     name: 'codex',
     command: 'codex',
-    note: '本机未安装，参数未实测；如需自动启动，在 .agent/config/agents.json 声明 { command, args }',
+    note: '本机未安装，参数未实测；如需自动启动，在 .agents/config/agents.json 声明 { command, args }',
     build: null,
   },
   claude: {
     name: 'claude',
     command: 'claude',
-    note: '本机未安装，参数未实测；如需自动启动，在 .agent/config/agents.json 声明 { command, args }',
+    note: '本机未安装，参数未实测；如需自动启动，在 .agents/config/agents.json 声明 { command, args }',
     build: null,
   },
 };
@@ -823,7 +823,7 @@ function runnerFor(agentName) {
     path: path_,
     detected: Boolean(path_),
     provider: declared ? 'project-config' : builtin ? 'builtin' : 'unknown',
-    note: builtin ? builtin.note : '未内置该 agent 的启动模板：请在 .agent/config/agents.json 声明 { command, args }',
+    note: builtin ? builtin.note : '未内置该 agent 的启动模板：请在 .agents/config/agents.json 声明 { command, args }',
     build(ctx) {
       if (argsTemplate) {
         return {
@@ -966,7 +966,7 @@ function cmdInit(argv) {
   const giPath = path.join(ROOT, '.gitignore');
   const gi = isFile(giPath) ? fs.readFileSync(giPath, 'utf8') : '';
   const giLines = new Set(gi.split('\n').map((l) => l.trim()));
-  const need = ['.agent/tasks/', '.agent/state/'];
+  const need = ['.agents/tasks/', '.agents/state/'];
   const missing = need.filter((e) => !giLines.has(e) && !giLines.has(`/${e}`));
   if (missing.length > 0) {
     let next = gi;
@@ -1013,7 +1013,7 @@ function cmdInit(argv) {
   } else if (registered.length === 0) {
     note('未探测到平台 worktree（当前只有主 checkout）。建议先建一个平台 worktree 作为集成边界：');
     note('  git worktree add <目录> -b <集成分支>    # 例：git worktree add wt/main -b feature/main');
-    note('然后在 .agent/config/platforms.json 里声明该平台，或重跑 agentctl init 自动登记。');
+    note('然后在 .agents/config/platforms.json 里声明该平台，或重跑 agentctl init 自动登记。');
   } else {
     note('已登记平台（可在 platforms.json 里补 aliases / test_command）：');
     printTable(['PLATFORM', 'BRANCH', 'WORKTREE'], registered.map((r) => [r.id, r.branch, r.worktree]));
@@ -1100,7 +1100,7 @@ function cmdTaskCreate(argv) {
   warnIfInPlatformWorktree();
   warnIfInTaskWorktree();
   if (WORKTREE_ROOT_INSIDE) {
-    warn(`worktree_root（${WORKTREE_ROOT}）位于仓库主 checkout 内部：任务 worktree 会污染主 checkout 的 git status，建议在 .agent/config/platforms.json 配置为仓库外的同级目录。`);
+    warn(`worktree_root（${WORKTREE_ROOT}）位于仓库主 checkout 内部：任务 worktree 会污染主 checkout 的 git status，建议在 .agents/config/platforms.json 配置为仓库外的同级目录。`);
   }
 
   const conflicts = findScopeConflicts(row.id, allowed, vals['--task'] || '');
@@ -1757,14 +1757,14 @@ function finishUpdateBase(task, newBase, dryRun) {
 
 // ============================ task adopt ============================
 
-// 注册表（.agent/tasks/*.json）是运行时状态，可能被误删；adopt 从任务 worktree
-// 内的 .agent/TASK.md + 任务分支重建记录，把孤儿任务重新纳入管理。
+// 注册表（.agents/tasks/*.json）是运行时状态，可能被误删；adopt 从任务 worktree
+// 内的 .agents/TASK.md + 任务分支重建记录，把孤儿任务重新纳入管理。
 function cmdTaskAdopt(argv) {
   parseFlags(argv);
   const cwd = normalizePath(process.cwd());
   const contextFile = taskContextPath(cwd);
   if (!isFile(contextFile)) {
-    die(`当前目录没有任务上下文：${contextFile}\ntask adopt 需在孤儿任务的 worktree 内运行（从 .agent/TASK.md 与任务分支重建注册表记录）`);
+    die(`当前目录没有任务上下文：${contextFile}\ntask adopt 需在孤儿任务的 worktree 内运行（从 .agents/TASK.md 与任务分支重建注册表记录）`);
   }
   const text = fs.readFileSync(contextFile, 'utf8');
   const field = (name) => {
@@ -1815,7 +1815,7 @@ function cmdTaskAdopt(argv) {
   const baseCommit = mb.stdout.trim();
 
   if (!buildPlatforms().some((r) => r.id === platform)) {
-    warn(`平台 ${platform} 不在当前 registry 中：记录照建，集成前先在 .agent/config/platforms.json 对齐。`);
+    warn(`平台 ${platform} 不在当前 registry 中：记录照建，集成前先在 .agents/config/platforms.json 对齐。`);
   }
 
   const task = normalizeTask({
@@ -2165,17 +2165,17 @@ function cmdDoctor(argv) {
 
   const giPath = path.join(ROOT, '.gitignore');
   const giLines = isFile(giPath) ? new Set(fs.readFileSync(giPath, 'utf8').split('\n').map((l) => l.trim())) : new Set();
-  const giMissing = ['.agent/tasks/', '.agent/state/'].filter((e) => !giLines.has(e) && !giLines.has(`/${e}`));
+  const giMissing = ['.agents/tasks/', '.agents/state/'].filter((e) => !giLines.has(e) && !giLines.has(`/${e}`));
   add('Runtime state gitignore', giMissing.length === 0 || tasks.length === 0,
     giMissing.length === 0
-      ? '.gitignore 已排除 .agent/tasks/ 与 .agent/state/'
+      ? '.gitignore 已排除 .agents/tasks/ 与 .agents/state/'
       : tasks.length === 0
         ? `尚无任务；需要时用 agentctl init 或在 .gitignore 追加：${giMissing.map((e) => `/${e}`).join(' ')}`
         : `.gitignore 缺少 ${giMissing.map((e) => `/${e}`).join(' ')}：任务记录会污染 git status（agentctl init 可自动补）`);
 
   add('Worktree root', !WORKTREE_ROOT_INSIDE,
     WORKTREE_ROOT_INSIDE
-      ? `${WORKTREE_ROOT} 位于主 checkout 内部，任务 worktree 会污染主 checkout 的 git status；建议在 .agent/config/platforms.json 把 worktree_root 配置为仓库外的同级目录`
+      ? `${WORKTREE_ROOT} 位于主 checkout 内部，任务 worktree 会污染主 checkout 的 git status；建议在 .agents/config/platforms.json 把 worktree_root 配置为仓库外的同级目录`
       : WORKTREE_ROOT);
 
   // agent/<agent>/<task-id> 分支存在但没有注册表记录 → 注册表被误删的孤儿
@@ -2205,9 +2205,9 @@ function cmdDoctor(argv) {
   add('Mode', true, `${mode}　cwd=${normalizePath(process.cwd())}`);
 
   const excludeFile = path.join(gitCommonDir(), 'info', 'exclude');
-  const excluded = isFile(excludeFile) && fs.readFileSync(excludeFile, 'utf8').split('\n').some((l) => l.trim() === '.agent/TASK.md');
+  const excluded = isFile(excludeFile) && fs.readFileSync(excludeFile, 'utf8').split('\n').some((l) => l.trim() === '.agents/TASK.md');
   add('Task context exclude', excluded || tasks.length === 0,
-    excluded ? `.agent/TASK.md 已在 ${excludeFile} 中排除` : '尚无任务（首次 task create 时自动写入 info/exclude）');
+    excluded ? `.agents/TASK.md 已在 ${excludeFile} 中排除` : '尚无任务（首次 task create 时自动写入 info/exclude）');
 
   if (JSON_OUT) {
     note(JSON.stringify({ root: ROOT, worktree_root: WORKTREE_ROOT, checks, platforms: platformRowsForOutput(), agents: agentRows.map((r) => ({ agent: r.name, detected: r.detected, path: r.path, provider: r.provider })) }, null, 2));
@@ -2254,13 +2254,13 @@ function cmdHelp() {
   agentctl init                      项目内初始化：探测平台生成 platforms.json、补 .gitignore 排除（幂等不覆盖）
   agentctl doctor                    Git / 仓库 / 平台 worktree / 任务 registry / Agent CLI / AGENTS.md
   agentctl agent list                列出内置 Agent runner 与检测结果
-  agentctl platform list             列出平台 registry（探测 + .agent/config/platforms.json 声明）
+  agentctl platform list             列出平台 registry（探测 + .agents/config/platforms.json 声明）
   agentctl task current              判断当前目录处于 Coordinator 还是 Worker 模式
 
 任务：
   agentctl task create --platform <平台> --agent <agent> [--title <文本>] [--task <id>] [选项]
       创建任务分支 agent/<agent>/<task-id> 与独立任务 worktree
-      <worktree_root>/<platform>/<task-id>，写入 .agent/tasks/<id>.json 与任务上下文 .agent/TASK.md。
+      <worktree_root>/<platform>/<task-id>，写入 .agents/tasks/<id>.json 与任务上下文 .agents/TASK.md。
       task id 缺省时按标题自动生成（<平台>-<slug>-NNN，同名递增）。
       选项：
         --title <文本>             任务标题（自动 task id 的来源）
@@ -2286,14 +2286,14 @@ function cmdHelp() {
       状态：${STATUSES.join(' / ')}
   agentctl task update-base <id> [--dry-run]  把平台分支新提交合并进任务分支并刷新基点
       冲突时保留进行中的 merge，解决后重跑收尾；ready 任务基点变更后状态退回 active。
-  agentctl task adopt                       在孤儿任务 worktree 内从 .agent/TASK.md 重建注册表记录
+  agentctl task adopt                       在孤儿任务 worktree 内从 .agents/TASK.md 重建注册表记录
   agentctl task merge-check <id>            只读判断能否并入平台分支（不改动平台 worktree）
   agentctl task integrate <id> [--force]    在平台 worktree 内 --no-ff 合并任务分支
   agentctl task remove <id> [--force]       仅 merged + 干净时回收 worktree / 分支 / 记录
 
 约定：
   · 平台 worktree 是 integration 边界；agent 开发一律在任务 worktree 内。
-  · .agent/tasks/*.json 为运行时状态（不入库）；注册表读改写走锁 + 原子替换。
+  · .agents/tasks/*.json 为运行时状态（不入库）；注册表读改写走锁 + 原子替换。
   · 不做文件锁：覆盖由 worktree 隔离，逻辑冲突交 Git 合并。
   · 在仓库主 checkout 或其任意 worktree 内均可运行（-C 指定目录）。`);
 }

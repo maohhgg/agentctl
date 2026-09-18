@@ -12,24 +12,24 @@ agentctl executes commands that are defined **inside the repository it runs in**
 
 - `task finish` runs the test command resolved from (highest priority first) the
   `--test-command` flag, the task record, or `test_command` /
-  `test_timeout` in `.agent/config/platforms.json` — a file that is **committed
+  `test_timeout` in `.agents/config/platforms.json` — a file that is **committed
   to the repo**.
 - `task start` executes an agent CLI through built-in templates or
-  `.agent/config/agents.json` — also committed to the repo.
+  `.agents/config/agents.json` — also committed to the repo.
 
 Consequence: **repository write access is code-execution trust**, the same trust
 level you already grant to CI. Practical rules:
 
-- Review changes to `.agent/config/*` the way you review CI workflow changes.
+- Review changes to `.agents/config/*` the way you review CI workflow changes.
 - Never point agentctl at a repository whose maintainers you do not trust.
 - Scoped `--allowed-paths` restricts what the *agent* may change; they are not a
   sandbox for the *test command*, which runs with your user's full privileges.
 
 ## Data handling
 
-- All state is local: `.agent/` files and git refs. agentctl makes **no network
+- All state is local: `.agents/` files and git refs. agentctl makes **no network
   requests** and collects **no telemetry**.
-- Task metadata (`.agent/tasks/*.json`, `.agent/TASK.md`) stores paths, branch
+- Task metadata (`.agents/tasks/*.json`, `.agents/TASK.md`) stores paths, branch
   names, timestamps and whatever text you pass via `--title` / `--objective` /
   `--requirements`. **Never put credentials in those fields** — they are plain
   files in your working tree.

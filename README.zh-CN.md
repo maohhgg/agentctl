@@ -33,10 +33,10 @@ checkout 时会互相覆盖文件、互相污染 git 状态——分支隔离解
 ```
 
 - **平台 worktree**（长期存在，每个交付目标一个：backend / web / 移动端…）：
-  在 `.agent/config/platforms.json` 声明，或由 `git worktree list` 自动探测；
+  在 `.agents/config/platforms.json` 声明，或由 `git worktree list` 自动探测；
   是唯一的集成边界。
 - **任务 worktree**（一条任务一个）：一条任务分支 + 一个独立 checkout +
-  一个 agent。由 agentctl 创建与回收；任务上下文 `.agent/TASK.md` 写在其中，
+  一个 agent。由 agentctl 创建与回收；任务上下文 `.agents/TASK.md` 写在其中，
   经 `.git/info/exclude` 排除、不进业务提交。
 
 物理隔离解决覆盖问题；逻辑冲突留给 Git 在集成阶段暴露。agentctl 刻意
@@ -47,7 +47,7 @@ checkout 时会互相覆盖文件、互相污染 git 状态——分支隔离解
 - **零依赖单文件**：只要 Node ≥ 20 + git。拷一个可执行文件进仓库（或
   `npm i -g`）即可工作。
 - **Agent 自治协议**：`agentctl task current` 判定当前是 Coordinator 还是
-  Worker；Worker 读 `.agent/TASK.md` 获取任务简报。往 `AGENTS.md` 里贴一段
+  Worker；Worker 读 `.agents/TASK.md` 获取任务简报。往 `AGENTS.md` 里贴一段
   协议，任何 agent 都能自组织（见下文）。
 - **范围写集合强制**：`--allowed-paths` glob 定义任务可触达的路径。
   `task check` / `task finish` 对越界文件失败——未跟踪、未暂存、已暂存、
@@ -65,7 +65,7 @@ checkout 时会互相覆盖文件、互相污染 git 状态——分支隔离解
   门禁重跑。
 - **并发安全注册表**：任务记录在 mkdir 互斥锁内以「临时文件 + 原子 rename」
   读写；两个 agent 同时 `task create` 不会撞名、不会互相覆盖。记录丢失时
-  可从任务 worktree 的 `.agent/TASK.md` 重建（`task adopt`）。
+  可从任务 worktree 的 `.agents/TASK.md` 重建（`task adopt`）。
 - **多平台注册表**：monorepo / 多端仓库可声明多个平台 worktree（别名 +
   各自的测试命令）；未声明的 worktree 自动探测。
 - **Runner 不猜参数**：只为真实安装实测过的 CLI（`omp`、`opencode`）内置
@@ -126,7 +126,7 @@ agentctl task remove backend-google-oauth-001       # 评审后回收 worktree �
 ## 多 agent 任务协议（agentctl）
 
 用 `agentctl task current` 判定角色：
-- 当前 worktree 里存在 `.agent/TASK.md` → 你是 **Worker**。
+- 当前 worktree 里存在 `.agents/TASK.md` → 你是 **Worker**。
 - 否则 → 你是 **Coordinator**。
 
 ### Coordinator（仓库根 / 平台 worktree）
@@ -142,7 +142,7 @@ agentctl task remove backend-google-oauth-001       # 评审后回收 worktree �
    integration 边界。
 
 ### Worker（任务 worktree）
-1. 读 `.agent/TASK.md`——Objective / Requirements / Scope / Restrictions。
+1. 读 `.agents/TASK.md`——Objective / Requirements / Scope / Restrictions。
 2. 只在 Scope 内实现；提交到任务分支。
 3. `agentctl task check <id>`（无越界文件），然后
    `agentctl task finish <id>`（门禁：干净、范围内、≥1 commit、测试过）。
@@ -150,7 +150,7 @@ agentctl task remove backend-google-oauth-001       # 评审后回收 worktree �
    `git checkout -- .` / `git stash`。
 ```
 
-`task current` 依据「worktree + `.agent/TASK.md`」判定模式，与目录名无关，
+`task current` 依据「worktree + `.agents/TASK.md`」判定模式，与目录名无关，
 人和 agent 用同一套指令。
 
 ## 命令速查
@@ -166,7 +166,7 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 | `agent list` | Agent runner 与本机检测结果 |
 | `platform list` | 平台注册表（探测 + 声明）、状态与别名 |
 | `task current` | 当前目录是 Coordinator 还是 Worker 模式 |
-| `task create` | 新任务：分支 + worktree + `.agent/TASK.md` + 注册表记录 |
+| `task create` | 新任务：分支 + worktree + `.agents/TASK.md` + 注册表记录 |
 | `task list` | 按 `--platform / --agent / --status / --feature` 过滤 |
 | `task show <id>` | 完整元数据 + 实时状态（脏 / 领先 / 已并入） |
 | `task start <id>` | 在任务 worktree 内启动 agent CLI |
@@ -174,7 +174,7 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 | `task diff <id>` | 相对 base 的差异（`--stat` / `--name-only` / `--working`） |
 | `task finish <id>` | 五项门禁 → 状态 `ready`；`--no-test` / `--test-command` / `--timeout` |
 | `task update-base <id>` | 把平台分支新提交合并进任务分支并刷新基点（冲突安全，`--dry-run`） |
-| `task adopt` | 从当前 worktree 的 `.agent/TASK.md` 重建丢失的注册表记录 |
+| `task adopt` | 从当前 worktree 的 `.agents/TASK.md` 重建丢失的注册表记录 |
 | `task set-status <id> <状态>` | 标记 `blocked` / `failed` / `cancelled` 等 |
 | `task merge-check <id>` | 只读合并预检；冲突退出码 1 |
 | `task integrate <id>` | `--no-ff` 并入平台分支；冲突可续做 |
@@ -195,7 +195,7 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 
 ## 配置
 
-**`.agent/config/platforms.json`**（随仓库提交；`agentctl init` 可按探测平台自动生成）：
+**`.agents/config/platforms.json`**（随仓库提交；`agentctl init` 可按探测平台自动生成）：
 
 ```jsonc
 {
@@ -213,7 +213,7 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 }
 ```
 
-**`.agent/config/agents.json`**（可选——为没有实测内置模板的 CLI 声明启动
+**`.agents/config/agents.json`**（可选——为没有实测内置模板的 CLI 声明启动
 模板；`{worktree}` 与 `{prompt}` 会被替换）：
 
 ```json
@@ -226,7 +226,7 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 内置模板只收录本机实测过参数的 CLI（`omp` 18.2.5、`opencode`）。其他
 agent CLI 请按上面声明——或者不声明，`task start` 会打印手工启动命令。
 
-任务记录在 `.agent/tasks/<id>.json`、运行时产物在 `.agent/state/`——都是
+任务记录在 `.agents/tasks/<id>.json`、运行时产物在 `.agents/state/`——都是
 运行时状态。`agentctl init` 会自动补 `.gitignore` 排除项，`doctor` 负责检查。
 
 ## 与同类工具的对比

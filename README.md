@@ -39,10 +39,10 @@ main checkout (hub: docs, contracts, coordination)
 ```
 
 - **Platform worktree** — long-lived, one per deliverable target (backend, web,
-  mobile…). Registered in `.agent/config/platforms.json` or auto-detected from
+  mobile…). Registered in `.agents/config/platforms.json` or auto-detected from
   `git worktree list`.
 - **Task worktree** — one per task: one task branch + one isolated checkout +
-  one agent. Created and reclaimed by agentctl. A task brief (`.agent/TASK.md`)
+  one agent. Created and reclaimed by agentctl. A task brief (`.agents/TASK.md`)
   is written into it and kept out of commits via `.git/info/exclude`.
 
 Physical isolation prevents overwriting; logical conflicts are left to Git at
@@ -54,7 +54,7 @@ integration time. agentctl deliberately implements **no file locks**.
   executable into your repo (or `npm i -g`) and it works.
 - **Agent-native protocol** — `agentctl task current` tells any agent whether it
   is a *Coordinator* or a *Worker*; the worker reads its brief from
-  `.agent/TASK.md`. One copy-paste block in your `AGENTS.md` makes any agent
+  `.agents/TASK.md`. One copy-paste block in your `AGENTS.md` makes any agent
   self-organizing (see [below](#the-coordinator--worker-protocol)).
 - **Scope write-set enforcement** — `--allowed-paths` globs define what a task
   may touch. `task check` / `task finish` fail on any out-of-scope file:
@@ -72,7 +72,7 @@ integration time. agentctl deliberately implements **no file locks**.
   a `ready` task whose base moved returns to `active` so its gates re-run.
 - **Concurrent-safe registry** — task records are mutated under a mkdir mutex
   with atomic-rename writes; two agents can `task create` at the same instant.
-  Lost records are recoverable from a task worktree's `.agent/TASK.md`
+  Lost records are recoverable from a task worktree's `.agents/TASK.md`
   (`task adopt`).
 - **Multi-platform registries** — monorepo / multi-target repos declare several
   platform worktrees with aliases and per-platform test commands; undeclared
@@ -139,7 +139,7 @@ protocol. Paste and adapt:
 ## Multi-agent task protocol (agentctl)
 
 Decide your role with `agentctl task current`:
-- If `.agent/TASK.md` exists in the current worktree → you are a **Worker**.
+- If `.agents/TASK.md` exists in the current worktree → you are a **Worker**.
 - Otherwise → you are the **Coordinator**.
 
 ### Coordinator (repo root / platform worktrees)
@@ -156,7 +156,7 @@ Decide your role with `agentctl task current`:
    into the main branch — platform worktrees are the integration boundary.
 
 ### Worker (task worktree)
-1. Read `.agent/TASK.md` — Objective / Requirements / Scope / Restrictions.
+1. Read `.agents/TASK.md` — Objective / Requirements / Scope / Restrictions.
 2. Implement **within Scope only**; commit to the task branch.
 3. `agentctl task check <id>` (no out-of-scope files), then
    `agentctl task finish <id>` (gates: clean tree, scope, ≥ 1 commit, tests).
@@ -164,7 +164,7 @@ Decide your role with `agentctl task current`:
    `git reset --hard` / `git clean` / `git checkout -- .` / `git stash`.
 ```
 
-`task current` decides the mode from the worktree + `.agent/TASK.md` pair, not
+`task current` decides the mode from the worktree + `.agents/TASK.md` pair, not
 from directory names, so the same instructions work for humans and agents.
 
 ## CLI reference
@@ -180,7 +180,7 @@ agentctl [-C <dir>] [--json] <command> [args]
 | `agent list` | Agent runners and whether they're detected on PATH |
 | `platform list` | Platform registry (auto-detected + declared), state and aliases |
 | `task current` | Coordinator or Worker mode for the current directory |
-| `task create` | New task: branch + worktree + `.agent/TASK.md` + registry record |
+| `task create` | New task: branch + worktree + `.agents/TASK.md` + registry record |
 | `task list` | Filter by `--platform / --agent / --status / --feature` |
 | `task show <id>` | Full metadata + live state (dirty, ahead, merged) |
 | `task start <id>` | Launch the agent CLI inside the task worktree |
@@ -188,7 +188,7 @@ agentctl [-C <dir>] [--json] <command> [args]
 | `task diff <id>` | Diff vs base (`--stat`, `--name-only`, `--working` for uncommitted) |
 | `task finish <id>` | Five gates → status `ready`; `--no-test` / `--test-command` / `--timeout` |
 | `task update-base <id>` | Merge platform-branch new commits into the task branch and refresh its base (conflict-safe, `--dry-run`) |
-| `task adopt` | Rebuild a lost task record from the current worktree's `.agent/TASK.md` |
+| `task adopt` | Rebuild a lost task record from the current worktree's `.agents/TASK.md` |
 | `task set-status <id> <status>` | Mark `blocked` / `failed` / `cancelled` / … |
 | `task merge-check <id>` | Read-only merge dry-run; exit 1 on conflict |
 | `task integrate <id>` | `--no-ff` merge into the platform branch; conflict-safe |
@@ -209,7 +209,7 @@ Open statuses (`created` … `integrating`) participate in scope-overlap detecti
 
 ## Configuration
 
-**`.agent/config/platforms.json`** (committed to your repo; `agentctl init`
+**`.agents/config/platforms.json`** (committed to your repo; `agentctl init`
 generates it from detected worktrees):
 
 ```jsonc
@@ -228,7 +228,7 @@ generates it from detected worktrees):
 }
 ```
 
-**`.agent/config/agents.json`** (optional — launch templates for CLIs without a
+**`.agents/config/agents.json`** (optional — launch templates for CLIs without a
 verified built-in one; `{worktree}` and `{prompt}` are substituted):
 
 ```json
@@ -242,8 +242,8 @@ We ship built-in templates only for flags we verified against a real installed
 version (`omp` 18.2.5, `opencode`). For your own agent CLIs, declare them as
 above — or don't, and `task start` will print the manual command.
 
-Task records live in `.agent/tasks/<id>.json` and runtime files in
-`.agent/state/` — both are runtime state. `agentctl init` adds the
+Task records live in `.agents/tasks/<id>.json` and runtime files in
+`.agents/state/` — both are runtime state. `agentctl init` adds the
 `.gitignore` entries for you and `doctor` checks them.
 
 ## How it compares
