@@ -1,0 +1,40 @@
+{
+  "name": "agent-task-worktree",
+  "version": "1.1.0",
+  "description": "agentctl — one git worktree per AI coding agent task: scope-enforced, gate-checked, zero dependencies, single file.",
+  "license": "MIT",
+  "author": "maohhgg",
+  "homepage": "https://github.com/maohhgg/agentctl#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maohhgg/agentctl.git"
+  },
+  "bugs": "https://github.com/maohhgg/agentctl/issues",
+  "keywords": [
+    "ai",
+    "agent",
+    "agents",
+    "claude",
+    "claude-code",
+    "codex",
+    "opencode",
+    "git",
+    "worktree",
+    "worktrees",
+    "parallel",
+    "coding-agent",
+    "cli"
+  ],
+  "bin": {
+    "agentctl": "agentctl"
+  },
+  "files": [
+    "agentctl"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "bash tests/agent/agentctl-test.sh"
+  }
+}

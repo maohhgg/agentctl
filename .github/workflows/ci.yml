@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 ships git 2.34, which lacks `merge-tree --write-tree`
+        # (needs 2.38) — it exercises the temp-worktree fallback path.
+        os: [ubuntu-latest, ubuntu-22.04, macos-latest]
+        node: [20, 22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Toolchain versions
+        run: node --version && git --version
+      - name: End-to-end tests
+        run: bash tests/agent/agentctl-test.sh
