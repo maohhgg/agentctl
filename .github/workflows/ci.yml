@@ -12,9 +12,12 @@ jobs:
       matrix:
         # ubuntu-22.04 ships git 2.34, which lacks `merge-tree --write-tree`
         # (needs 2.38) — it exercises the temp-worktree fallback path.
-        os: [ubuntu-latest, ubuntu-22.04, macos-latest]
+        os: [ubuntu-latest, ubuntu-22.04, macos-latest, windows-latest]
         node: [20, 22, 24]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

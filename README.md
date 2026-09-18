@@ -102,7 +102,8 @@ curl -fsSL https://raw.githubusercontent.com/maohhgg/agentctl/main/agentctl -o a
 
 Requirements: **Node ≥ 20** and **git ≥ 2.31** (git ≥ 2.38 recommended — enables
 the fast `merge-tree` pre-check; older gits use an automatic fallback).
-Linux and macOS; Windows via Git Bash / WSL.
+Linux, macOS, and Windows: natively supported (test commands run through
+PowerShell); the test suite itself runs under Git Bash.
 
 ## Quickstart
 

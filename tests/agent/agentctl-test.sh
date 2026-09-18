@@ -23,6 +23,11 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-test.XXXXXX")"
 # macOS：TMPDIR 位于 /var → /private/var 符号链接；CLI 与 git 均按 realpath 物理路径输出，
 # 夹具路径必须对齐，否则 doctor / platform list 的路径断言在 macOS 上失败
 WORK="$(cd "$WORK" && pwd -P)"
+# Git Bash（Windows）：node.exe 是原生程序，报告 C:/... 物理路径而非 MSYS 虚拟路径 /tmp/...，
+# 需用 cygpath 转换（-m = 正斜杠的 Windows 路径）；Linux/macOS 无 cygpath，此步为空操作
+if command -v cygpath >/dev/null 2>&1; then
+  WORK="$(cygpath -m "$WORK")"
+fi
 REPO="$WORK/project"
 WTROOT="$WORK/project-agent-worktrees" # 默认：../<repo basename>-agent-worktrees
 OUT=""

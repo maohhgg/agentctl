@@ -143,13 +143,18 @@ function resolveRoot() {
   return gitOut(['rev-parse', '--path-format=absolute', '--show-toplevel']).trim();
 }
 
-// 绝对化；存在时解析符号链接（与 git 报告的 worktree 路径可比对）
+// 绝对化；存在时解析符号链接（与 git 报告的 worktree 路径可比对）。
+// 统一归一为正斜杠：git 在 Windows 上输出 / 分隔，而 fs.realpathSync 输出 \。
+function toPosix(p) {
+  return String(p).replace(/\\/g, '/');
+}
+
 function normalizePath(p) {
   const abs = path.isAbsolute(p) ? p : path.join(ROOT, p);
   try {
-    return fs.realpathSync(abs);
+    return toPosix(fs.realpathSync(abs));
   } catch {
-    return path.resolve(abs).replace(/(.)\/+$/, '$1');
+    return toPosix(path.resolve(abs)).replace(/(.)\/+$/, '$1');
   }
 }
 
@@ -216,7 +221,9 @@ function detectPlatforms() {
 }
 
 function isUnder(p, dir) {
-  return p === dir || p.startsWith(`${dir}${path.sep}`);
+  const a = toPosix(p);
+  const b = toPosix(dir);
+  return a === b || a.startsWith(`${b}/`);
 }
 
 function buildPlatforms() {
@@ -356,8 +363,9 @@ function mergeInProgress(wt) {
 
 function relToRoot(p) {
   if (!p) return '';
-  const prefix = `${ROOT}${path.sep}`;
-  return p.startsWith(prefix) ? p.slice(prefix.length) : p;
+  const prefix = `${toPosix(ROOT)}/`;
+  const abs = toPosix(p);
+  return abs.startsWith(prefix) ? abs.slice(prefix.length) : abs;
 }
 
 function currentBranch(cwd = process.cwd()) {
@@ -781,12 +789,24 @@ function knownAgentNames() {
 
 function detectAgentFromProcessChain() {
   const known = knownAgentNames();
+  const isWin = process.platform === 'win32';
+  const readInfo = (pid) => {
+    if (!isWin) {
+      const r = spawnSync('ps', ['-o', 'ppid=,args=', '-p', String(pid)], { encoding: 'utf8' });
+      return r.status === 0 ? r.stdout.replace(/\r/g, '').replace(/\n+$/, '') : '';
+    }
+    // Windows：PowerShell CIM 查询 PPID 与 CommandLine（ps 不存在）
+    const script = `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object -First 1; if ($p) { "$($p.ParentProcessId) $($p.CommandLine)" }`;
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
+    if (r.status !== 0 || !r.stdout.trim()) return '';
+    return r.stdout.replace(/\r/g, '').replace(/\n+$/, '');
+  };
   let pid = process.pid;
   for (let depth = 0; depth < 15; depth++) {
     if (pid <= 1) return '';
-    const r = spawnSync('ps', ['-o', 'ppid=,args=', '-p', String(pid)], { encoding: 'utf8' });
-    if (r.status !== 0 || !r.stdout.trim()) return '';
-    const m = r.stdout.replace(/\n+$/, '').match(/^\s*(\d+)\s+(.*)$/);
+    const line = readInfo(pid);
+    if (!line) return '';
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
     if (!m) return '';
     pid = Number.parseInt(m[1], 10);
     for (const token of m[2].split(/\s+/)) {
@@ -1616,7 +1636,11 @@ function cmdTaskFinish(argv) {
         spawnOpts.timeout = timeoutSec * 1000;
         spawnOpts.killSignal = 'SIGTERM';
       }
-      const res = spawnSync('bash', ['-c', testCommand], spawnOpts);
+      // POSIX 走 bash；Windows 原生走 PowerShell（无 bash 依赖）
+      const runner = process.platform === 'win32'
+        ? { cmd: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', testCommand] }
+        : { cmd: 'bash', args: ['-c', testCommand] };
+      const res = spawnSync(runner.cmd, runner.args, spawnOpts);
       const timedOut = Boolean(timeoutSec) && Boolean(res.error) && res.error.code === 'ETIMEDOUT';
       const rc = res.status === null ? 1 : res.status;
       note('');

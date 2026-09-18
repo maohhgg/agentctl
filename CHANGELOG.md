@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native Windows support**: `task finish` runs test commands through
+  PowerShell (`powershell.exe -NoProfile -NonInteractive -Command`) instead of
+  bash; `--agent` process-ancestry self-identification falls back to
+  `Win32_Process` CIM queries when `ps` is unavailable; internal paths are
+  normalized to forward slashes so git's Windows output compares correctly.
+  Validated end-to-end on a real Windows 11 machine: a 23-check native
+  PowerShell scenario plus the full 245-assertion suite under Git Bash.
+- CI matrix now includes `windows-latest` (suite via Git Bash).
 - **Agent self-identification**: `--agent` is now optional at `task create`.
   When omitted, the name resolves from the `AGENTCTL_AGENT` environment
   variable, then from the process ancestry — walking the PPID chain via `ps`

@@ -91,7 +91,8 @@ curl -fsSL https://raw.githubusercontent.com/maohhgg/agentctl/main/agentctl -o a
 ```
 
 要求：**Node ≥ 20**、**git ≥ 2.31**（建议 ≥ 2.38，可走 `merge-tree` 快速
-预检；旧版自动回退）。支持 Linux / macOS；Windows 走 Git Bash / WSL。
+预检；旧版自动回退）。支持 Linux / macOS / **Windows 原生**（测试命令经
+PowerShell 执行；测试套件自身在 Git Bash 下运行）。
 
 ## 快速上手
 
