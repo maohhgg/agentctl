@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.0.3] - 2026-09-19
 
 ### Added
 
@@ -113,5 +113,6 @@ Initial public development release.
   `task diff` (base / working / staged).
 - End-to-end test suite running entirely in throwaway temp repos.
 
+[0.0.3]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.3
 [0.0.2]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.2
 [0.0.1]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.1
