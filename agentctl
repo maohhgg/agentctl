@@ -25,7 +25,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync, spawn } = require('node:child_process');
 
-const VERSION = '0.0.1';
+const VERSION = '0.0.2';
 
 // 输出被下游提前关闭（如 `agentctl ... | head`）时静默退出，不抛 EPIPE 堆栈
 process.stdout.on('error', (err) => {
@@ -951,6 +951,78 @@ function parseAllowedPaths(raw) {
     }
   }
   return [...new Set(out)];
+}
+
+// ============================ init ============================
+
+// 项目内一键初始化：由 git worktree list 探测平台并生成 platforms.json，
+// 确保 .gitignore 排除运行时状态。幂等：已存在的配置一律不覆盖。
+function cmdInit(argv) {
+  parseFlags(argv);
+  const created = [];
+  const skipped = [];
+
+  // 1. .gitignore：排除任务注册表与运行时状态
+  const giPath = path.join(ROOT, '.gitignore');
+  const gi = isFile(giPath) ? fs.readFileSync(giPath, 'utf8') : '';
+  const giLines = new Set(gi.split('\n').map((l) => l.trim()));
+  const need = ['.agent/tasks/', '.agent/state/'];
+  const missing = need.filter((e) => !giLines.has(e) && !giLines.has(`/${e}`));
+  if (missing.length > 0) {
+    let next = gi;
+    if (next !== '' && !next.endsWith('\n')) next += '\n';
+    next += '# agentctl 运行时状态（任务注册表与临时产物，不入库）\n';
+    next += `${missing.map((e) => `/${e}`).join('\n')}\n`;
+    fs.writeFileSync(giPath, next);
+    created.push(`.gitignore（追加 ${missing.map((e) => `/${e}`).join('、')}）`);
+  }
+
+  // 2. 平台 registry：探测生成；用户手工维护的已有配置绝不覆盖
+  const detected = detectPlatforms();
+  const registered = [];
+  if (isFile(CONFIG_FILE)) {
+    skipped.push(`${relToRoot(CONFIG_FILE)}（已存在，不覆盖；调整平台请手工编辑，或删除后重跑 init）`);
+  } else {
+    const platforms = {};
+    const used = new Set();
+    for (const d of detected) {
+      let id = path.basename(d.path);
+      let n = 2;
+      while (used.has(id)) id = `${path.basename(d.path)}-${n++}`;
+      used.add(id);
+      platforms[id] = { worktree: relToRoot(d.path), branch: d.branch };
+      registered.push({ id, worktree: relToRoot(d.path), branch: d.branch });
+    }
+    writeJsonAtomic(CONFIG_FILE, { platforms });
+    created.push(`${relToRoot(CONFIG_FILE)}（登记 ${registered.length} 个探测平台）`);
+  }
+
+  if (JSON_OUT) {
+    note(JSON.stringify({ initialized: true, created, skipped, platforms: registered.map((r) => r.id) }, null, 2));
+    return;
+  }
+
+  note('agentctl init');
+  note('');
+  for (const c of created) note(`已生成：${c}`);
+  for (const s of skipped) note(`跳过：${s}`);
+  if (created.length === 0 && skipped.length === 0) note('没有需要初始化的内容（.gitignore 已含排除项，平台配置已存在）。');
+  note('');
+  if (skipped.length > 0) {
+    note('平台配置已存在：agentctl platform list 查看当前 registry，或 agentctl doctor 自检。');
+  } else if (registered.length === 0) {
+    note('未探测到平台 worktree（当前只有主 checkout）。建议先建一个平台 worktree 作为集成边界：');
+    note('  git worktree add <目录> -b <集成分支>    # 例：git worktree add wt/main -b feature/main');
+    note('然后在 .agent/config/platforms.json 里声明该平台，或重跑 agentctl init 自动登记。');
+  } else {
+    note('已登记平台（可在 platforms.json 里补 aliases / test_command）：');
+    printTable(['PLATFORM', 'BRANCH', 'WORKTREE'], registered.map((r) => [r.id, r.branch, r.worktree]));
+    note('');
+    note('下一步：');
+    note(`  agentctl task create --platform <id> --agent <omp|opencode|…> --title '…' --allowed-paths '<globs>'`);
+  }
+  note('');
+  note('自检：agentctl doctor');
 }
 
 // ============================ platform list ============================
@@ -2091,6 +2163,16 @@ function cmdDoctor(argv) {
   add('Task Registry', isDir(TASKS_DIR) || tasks.length === 0,
     `${tasks.length} 条任务${tasks.length ? `（${Object.entries(byStatus).map(([k, v]) => `${k}:${v}`).join(' ')}）` : ''}`);
 
+  const giPath = path.join(ROOT, '.gitignore');
+  const giLines = isFile(giPath) ? new Set(fs.readFileSync(giPath, 'utf8').split('\n').map((l) => l.trim())) : new Set();
+  const giMissing = ['.agent/tasks/', '.agent/state/'].filter((e) => !giLines.has(e) && !giLines.has(`/${e}`));
+  add('Runtime state gitignore', giMissing.length === 0 || tasks.length === 0,
+    giMissing.length === 0
+      ? '.gitignore 已排除 .agent/tasks/ 与 .agent/state/'
+      : tasks.length === 0
+        ? `尚无任务；需要时用 agentctl init 或在 .gitignore 追加：${giMissing.map((e) => `/${e}`).join(' ')}`
+        : `.gitignore 缺少 ${giMissing.map((e) => `/${e}`).join(' ')}：任务记录会污染 git status（agentctl init 可自动补）`);
+
   add('Worktree root', !WORKTREE_ROOT_INSIDE,
     WORKTREE_ROOT_INSIDE
       ? `${WORKTREE_ROOT} 位于主 checkout 内部，任务 worktree 会污染主 checkout 的 git status；建议在 .agent/config/platforms.json 把 worktree_root 配置为仓库外的同级目录`
@@ -2169,6 +2251,7 @@ function cmdHelp() {
   agentctl [-C <目录>] [--json] <命令> [参数]
 
 自检：
+  agentctl init                      项目内初始化：探测平台生成 platforms.json、补 .gitignore 排除（幂等不覆盖）
   agentctl doctor                    Git / 仓库 / 平台 worktree / 任务 registry / Agent CLI / AGENTS.md
   agentctl agent list                列出内置 Agent runner 与检测结果
   agentctl platform list             列出平台 registry（探测 + .agent/config/platforms.json 声明）
@@ -2260,6 +2343,7 @@ function main() {
   ROOT = resolveRoot();
   configInit();
 
+  if (cmd === 'init') return cmdInit(rest);
   if (cmd === 'doctor') return cmdDoctor(rest);
   if (cmd === 'platform') {
     const sub = rest[0] || 'list';

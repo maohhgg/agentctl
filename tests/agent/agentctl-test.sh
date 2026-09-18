@@ -6,7 +6,7 @@
 # TASK.md 任务上下文（含不进业务提交）、allowed_paths 范围检查、scope 重叠检测、
 # finish 门禁（含测试超时）与 Worker 完成摘要、merge-check（只读）、integrate（含冲突续做）、
 # update-base（基点推进与冲突续做）、adopt（注册表重建）、手工合并放行回收、回收规则、
-# 平台 worktree 告警、AgentRunner（自动启动与降级），以及四个并发场景：
+# init（配置生成 / gitignore / 幂等）、平台 worktree 告警、AgentRunner（自动启动与降级），以及四个并发场景：
 #   Case 1 两个 agent 同时创建任务　Case 2 两个任务改同一文件互不覆盖
 #   Case 3 merge-check 发现 Git conflict　Case 4 scope 重叠被拦截
 #
@@ -577,6 +577,34 @@ JSON
 run doctor
 assert_out_contains 'worktree_root 在仓库内 → doctor 提示' '位于主 checkout 内部'
 
-section '24. 结束'
+section '24. agentctl init：生成配置、补 .gitignore、幂等'
+# 还原到「未初始化」状态：删平台配置、去掉 gitignore 排除项
+rm -f "$REPO/.agent/config/platforms.json"
+grep -v -e '^/\.agent/tasks/$' -e '^/\.agent/state/$' "$REPO/.gitignore" >"$REPO/.gitignore.tmp" && mv "$REPO/.gitignore.tmp" "$REPO/.gitignore"
+run init
+assert_rc 'init 退出码 0' 0
+assert_out_contains 'init 报告生成 platforms.json' 'platforms.json'
+assert_out_contains 'init 报告补写 gitignore' '.gitignore'
+[[ -f "$REPO/.agent/config/platforms.json" ]] && pass '配置文件已生成' || fail '配置文件已生成'
+[[ "$(json_get "$REPO/.agent/config/platforms.json" platforms.backend.branch)" == backend ]] && pass '探测平台 backend 已登记' || fail '探测平台 backend 已登记'
+[[ "$(json_get "$REPO/.agent/config/platforms.json" platforms.web.branch)" == web ]] && pass '探测平台 web 已登记' || fail '探测平台 web 已登记'
+grep -q '^/\.agent/tasks/$' "$REPO/.gitignore" && pass 'gitignore 已补 .agent/tasks/' || fail 'gitignore 已补 .agent/tasks/'
+run platform list
+assert_out_contains '生成配置后 platform list 正常' 'backend'
+run task create --platform backend --agent codex --task task-init --allowed-paths 'src/other/init/**'
+assert_rc '生成配置后可直接建任务' 0
+run task remove task-init --force
+assert_rc '清理 task-init' 0
+# 幂等：已有配置不覆盖、gitignore 不重复追加
+cp "$REPO/.agent/config/platforms.json" "$WORK/platforms.before.json"
+run init
+assert_rc '重复 init 退出码 0' 0
+assert_out_contains '已存在配置不覆盖' '不覆盖'
+cmp "$WORK/platforms.before.json" "$REPO/.agent/config/platforms.json" && pass '配置未被改写' || fail '配置未被改写'
+[[ "$(grep -c '^/\.agent/tasks/$' "$REPO/.gitignore")" == 1 ]] && pass 'gitignore 不重复追加' || fail 'gitignore 不重复追加'
+run doctor
+assert_out_contains 'doctor 确认 gitignore 排除' 'Runtime state gitignore: OK'
+
+section '25. 结束'
 printf '\n通过 %d 项，失败 %d 项\n' "$PASS" "$FAILED"
 [[ "$FAILED" == 0 ]] || exit 1
