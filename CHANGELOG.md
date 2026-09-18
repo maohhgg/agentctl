@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.2] - 2026-09-19
+
+### Added
+
+- `agentctl init`: one-command project setup — registers detected platform
+  worktrees into `.agent/config/platforms.json` (leaving `test_command` /
+  `aliases` for manual refinement) and appends the `.agent/tasks/` /
+  `.agent/state/` exclusions to `.gitignore`. Idempotent: existing config is
+  never overwritten. When no platform worktrees exist yet, prints the exact
+  `git worktree add` command to bootstrap the integration boundary.
+- `doctor` now checks the runtime-state `.gitignore` entries
+  (`Runtime state gitignore`), completing the init/doctor pair.
+
 ## [0.0.1] - 2026-09-19
 
 Initial public development release.
@@ -57,4 +70,5 @@ Initial public development release.
   `task diff` (base / working / staged).
 - End-to-end test suite running entirely in throwaway temp repos.
 
+[0.0.2]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.2
 [0.0.1]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.1

@@ -93,22 +93,8 @@ curl -fsSL https://raw.githubusercontent.com/maohhgg/agentctl/main/agentctl -o a
 
 ```bash
 cd my-repo
+agentctl init                          # 一次性初始化：登记探测平台 + 补 .gitignore 排除
 agentctl doctor                        # 环境自检
-
-# 一次性配置（可选——不配置也能按 git worktree 自动探测平台）
-mkdir -p .agent/config
-cat > .agent/config/platforms.json <<'JSON'
-{
-  "platforms": {
-    "backend": {
-      "worktree": "wt/backend",
-      "branch": "feature/backend",
-      "aliases": ["api"],
-      "test_command": "composer test"
-    }
-  }
-}
-JSON
 
 # 建任务：codex worker，只许改 src/auth/**
 agentctl task create --platform backend --agent codex \
@@ -175,6 +161,7 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 
 | 命令 | 说明 |
 |---|---|
+| `init` | 一次性初始化：按探测平台生成 `platforms.json`、补 `.gitignore` 排除（幂等，绝不覆盖） |
 | `doctor` | 自检：git / 仓库 / worktree / 注册表 / agent CLI / 当前模式 |
 | `agent list` | Agent runner 与本机检测结果 |
 | `platform list` | 平台注册表（探测 + 声明）、状态与别名 |
@@ -208,7 +195,7 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 
 ## 配置
 
-**`.agent/config/platforms.json`**（随仓库提交）：
+**`.agent/config/platforms.json`**（随仓库提交；`agentctl init` 可按探测平台自动生成）：
 
 ```jsonc
 {
@@ -240,7 +227,7 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 agent CLI 请按上面声明——或者不声明，`task start` 会打印手工启动命令。
 
 任务记录在 `.agent/tasks/<id>.json`、运行时产物在 `.agent/state/`——都是
-运行时状态，请加入 `.gitignore`（`doctor` 会提醒）。
+运行时状态。`agentctl init` 会自动补 `.gitignore` 排除项，`doctor` 负责检查。
 
 ## 与同类工具的对比
 

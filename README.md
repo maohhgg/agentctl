@@ -104,22 +104,8 @@ Linux and macOS; Windows via Git Bash / WSL.
 
 ```bash
 cd my-repo
+agentctl init                          # one-time setup: register detected platforms + fix .gitignore
 agentctl doctor                        # environment self-check
-
-# optional one-time config — platform worktrees are auto-detected even without it
-mkdir -p .agent/config
-cat > .agent/config/platforms.json <<'JSON'
-{
-  "platforms": {
-    "backend": {
-      "worktree": "wt/backend",          # path relative to repo root
-      "branch": "feature/backend",
-      "aliases": ["api"],
-      "test_command": "composer test"
-    }
-  }
-}
-JSON
 
 # create a task for a codex worker, confined to src/auth/**
 agentctl task create --platform backend --agent codex \
@@ -189,6 +175,7 @@ agentctl [-C <dir>] [--json] <command> [args]
 
 | Command | Purpose |
 |---|---|
+| `init` | One-time setup: generate `platforms.json` from detected worktrees, add `.gitignore` entries (idempotent, never overwrites) |
 | `doctor` | Self-check: git, repo, worktrees, registry, agent CLIs, mode |
 | `agent list` | Agent runners and whether they're detected on PATH |
 | `platform list` | Platform registry (auto-detected + declared), state and aliases |
@@ -222,7 +209,8 @@ Open statuses (`created` … `integrating`) participate in scope-overlap detecti
 
 ## Configuration
 
-**`.agent/config/platforms.json`** (committed to your repo):
+**`.agent/config/platforms.json`** (committed to your repo; `agentctl init`
+generates it from detected worktrees):
 
 ```jsonc
 {
@@ -255,8 +243,8 @@ version (`omp` 18.2.5, `opencode`). For your own agent CLIs, declare them as
 above — or don't, and `task start` will print the manual command.
 
 Task records live in `.agent/tasks/<id>.json` and runtime files in
-`.agent/state/` — both are runtime state; add them to your `.gitignore`
-(`doctor` reminds you).
+`.agent/state/` — both are runtime state. `agentctl init` adds the
+`.gitignore` entries for you and `doctor` checks them.
 
 ## How it compares
 
