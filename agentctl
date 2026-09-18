@@ -1,0 +1,1981 @@
+#!/usr/bin/env node
+'use strict';
+//
+// agentctl — 两级 worktree 模型的第二级：Agent 任务级 worktree 管理
+//
+// 模型：
+//   平台 worktree（Platform Worktree，长期存在，如 wt/php-backend @ feature/php-backend）
+//       —— 平台级 integration 边界：只做 merge / test / debug / review / release，
+//          不作为 Coding Agent 的日常开发目录。
+//   Agent 任务 worktree（Task Worktree，一条任务一个）
+//       ../<repo>-agent-worktrees/<platform>/<task-id> @ agent/<agent>/<task-id>
+//       —— 单个 Agent 的独立开发工作区，物理文件隔离由 git worktree 提供，
+//          内含 .agent/TASK.md 作为当前任务上下文（由 .git/info/exclude 排除，不进业务提交）。
+//
+// 状态：
+//   .agent/config/platforms.json   平台 registry（入库；缺省时按 git worktree 自动探测）
+//   .agent/config/agents.json      Agent runner 命令模板（可选，用于未内置实测参数的 CLI）
+//   .agent/tasks/<task-id>.json    任务元数据（运行时状态，不入库）
+//   .agent/state/                  运行时临时产物与注册表锁（不入库）
+//
+// 依赖：node ≥ 20、git。无第三方依赖。手册：README.md
+
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { spawnSync, spawn } = require('node:child_process');
+
+const VERSION = '1.1.0';
+
+// 输出被下游提前关闭（如 `agentctl ... | head`）时静默退出，不抛 EPIPE 堆栈
+process.stdout.on('error', (err) => {
+  if (err && err.code === 'EPIPE') process.exit(0);
+  throw err;
+});
+process.stderr.on('error', () => {});
+
+const SELF = (() => {
+  try {
+    return fs.realpathSync(process.argv[1]);
+  } catch {
+    return process.argv[1];
+  }
+})();
+
+// ============================ 基础输出 ============================
+
+function note(msg = '') {
+  process.stdout.write(`${msg}\n`);
+}
+
+function warn(msg) {
+  process.stderr.write(`WARNING: ${msg}\n`);
+}
+
+function die(msg) {
+  process.stderr.write(`ERROR: ${msg}\n`);
+  process.exit(2);
+}
+
+function usageError(msg) {
+  process.stderr.write(`ERROR: ${msg}\n`);
+  process.stderr.write('运行 agentctl help 查看用法。\n');
+  process.exit(2);
+}
+
+function okFail(ok) {
+  return ok ? 'OK' : 'FAIL';
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// ============================ git ============================
+
+const GIT_ENV = { ...process.env, LC_ALL: 'C' };
+
+function git(args, opts = {}) {
+  const res = spawnSync('git', args, {
+    cwd: opts.cwd,
+    env: GIT_ENV,
+    encoding: 'utf8',
+    maxBuffer: 256 * 1024 * 1024,
+  });
+  if (res.error) die(`无法执行 git：${res.error.message}`);
+  return { status: res.status === null ? 1 : res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+}
+
+function gitOut(args, opts = {}) {
+  const r = git(args, opts);
+  if (r.status !== 0) die(`git ${args.join(' ')} 失败：${(r.stderr || r.stdout).trim()}`);
+  return r.stdout;
+}
+
+function gitQuiet(args, opts = {}) {
+  return git(args, opts).status === 0;
+}
+
+function lines(text) {
+  return text.split('\n').filter((l) => l !== '');
+}
+
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isFile(p) {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// ============================ 仓库与配置 ============================
+
+let ROOT = '';
+let AGENT_DIR = '';
+let CONFIG_FILE = '';
+let TASKS_DIR = '';
+let STATE_DIR = '';
+let WORKTREE_ROOT = '';
+let BRANCH_PREFIX = 'agent';
+let CONFIG = {}; // .agent/config/platforms.json
+let AGENT_CONFIG = {}; // .agent/config/agents.json
+
+function resolveRoot() {
+  const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  if (common.status !== 0) {
+    die('当前目录不在 git 仓库内：agentctl 需在仓库主 checkout 或其任一 worktree 内运行');
+  }
+  const commonDir = common.stdout.trim();
+  if (git(['rev-parse', '--is-bare-repository']).stdout.trim() === 'true') {
+    die('裸仓库没有工作区，不支持 agentctl');
+  }
+  if (path.basename(commonDir) === '.git') return path.dirname(commonDir);
+  return gitOut(['rev-parse', '--path-format=absolute', '--show-toplevel']).trim();
+}
+
+// 绝对化；存在时解析符号链接（与 git 报告的 worktree 路径可比对）
+function normalizePath(p) {
+  const abs = path.isAbsolute(p) ? p : path.join(ROOT, p);
+  try {
+    return fs.realpathSync(abs);
+  } catch {
+    return path.resolve(abs).replace(/(.)\/+$/, '$1');
+  }
+}
+
+function readJsonConfig(file, label) {
+  if (!isFile(file)) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    die(`${label} 不是合法 JSON：${file}（${e.message}）`);
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    die(`${label} 顶层必须是对象：${file}`);
+  }
+  return parsed;
+}
+
+function configInit() {
+  AGENT_DIR = path.join(ROOT, '.agent');
+  CONFIG_FILE = path.join(AGENT_DIR, 'config', 'platforms.json');
+  TASKS_DIR = path.join(AGENT_DIR, 'tasks');
+  STATE_DIR = path.join(AGENT_DIR, 'state');
+
+  CONFIG = readJsonConfig(CONFIG_FILE, '平台配置');
+  AGENT_CONFIG = readJsonConfig(path.join(AGENT_DIR, 'config', 'agents.json'), 'Agent 配置');
+
+  const wr =
+    typeof CONFIG.worktree_root === 'string' && CONFIG.worktree_root
+      ? CONFIG.worktree_root
+      : path.join('..', `${path.basename(ROOT)}-agent-worktrees`);
+  BRANCH_PREFIX = typeof CONFIG.branch_prefix === 'string' && CONFIG.branch_prefix ? CONFIG.branch_prefix : 'agent';
+  WORKTREE_ROOT = normalizePath(wr);
+}
+
+// ============================ 平台注册表 ============================
+// 平台 = 长期存在的平台 worktree（主 checkout 与任务 worktree 除外）。
+// 来源：git worktree 自动探测 + .agent/config/platforms.json 声明（声明提供 id 与别名；
+// 路径、分支以实际 worktree 为准，不一致即报错，不静默改写）。
+
+function detectPlatforms() {
+  const raw = gitOut(['-C', ROOT, 'worktree', 'list', '--porcelain']);
+  const all = [];
+  let cur = null;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      cur = { path: line.slice('worktree '.length), branch: null, skip: false };
+      all.push(cur);
+    } else if (line.startsWith('branch refs/heads/')) {
+      if (cur) cur.branch = line.slice('branch refs/heads/'.length);
+    } else if (line === 'detached' || line === 'bare') {
+      if (cur) cur.skip = true;
+    }
+  }
+  const detected = [];
+  for (const wt of all) {
+    if (wt.skip || !wt.branch) continue;
+    const abs = normalizePath(wt.path);
+    if (abs === ROOT) continue; // 主 checkout = 文档/契约枢纽
+    if (isUnder(abs, WORKTREE_ROOT)) continue; // 任务 worktree
+    detected.push({ path: abs, branch: wt.branch });
+  }
+  return detected;
+}
+
+function isUnder(p, dir) {
+  return p === dir || p.startsWith(`${dir}${path.sep}`);
+}
+
+function buildPlatforms() {
+  const detected = detectPlatforms();
+  const rows = [];
+  const used = new Set();
+  const declared = CONFIG.platforms && typeof CONFIG.platforms === 'object' ? CONFIG.platforms : {};
+
+  for (const id of Object.keys(declared).sort()) {
+    const entry = declared[id] && typeof declared[id] === 'object' ? declared[id] : {};
+    const aliases = Array.isArray(entry.aliases) ? entry.aliases.filter((a) => typeof a === 'string') : [];
+    const declaredWt = typeof entry.worktree === 'string' ? entry.worktree : '';
+    const declaredBr = typeof entry.branch === 'string' ? entry.branch : '';
+    if (!declaredWt || !declaredBr) {
+      rows.push({ id, worktree: '', branch: '', source: 'declared', state: '配置缺 worktree/branch', aliases });
+      continue;
+    }
+    const abs = normalizePath(declaredWt);
+    const idx = detected.findIndex((d) => d.path === abs);
+    if (idx === -1) {
+      const exists = fs.existsSync(abs);
+      rows.push({
+        id,
+        worktree: abs,
+        branch: declaredBr,
+        source: 'declared',
+        state: exists ? '目录存在但未注册为 worktree' : 'worktree 缺失',
+        aliases,
+      });
+    } else {
+      used.add(idx);
+      const d = detected[idx];
+      rows.push({
+        id,
+        worktree: d.path,
+        branch: d.branch,
+        source: 'declared',
+        state: d.branch === declaredBr ? 'ok' : `声明分支不符（实际 ${d.branch}）`,
+        aliases,
+      });
+    }
+  }
+
+  for (let i = 0; i < detected.length; i++) {
+    if (used.has(i)) continue;
+    const base = path.basename(detected[i].path);
+    let id = base;
+    let n = 2;
+    while (rows.some((r) => r.id === id)) id = `${base}-${n++}`;
+    rows.push({ id, worktree: detected[i].path, branch: detected[i].branch, source: 'detected', state: 'ok', aliases: [] });
+  }
+  return rows;
+}
+
+// 某平台可用的全部名称（id + 声明别名 + 由 id/分支派生的别名）
+function aliasesFor(row) {
+  const out = [row.id, ...row.aliases];
+  if (row.branch) {
+    out.push(row.branch);
+    const tail = row.branch.split('/').slice(1).join('/');
+    if (tail) out.push(tail);
+  }
+  const dash = row.id.indexOf('-');
+  if (dash !== -1) out.push(row.id.slice(dash + 1));
+  return [...new Set(out.filter(Boolean))];
+}
+
+function resolvePlatform(name) {
+  if (!name) die('缺少 --platform');
+  const rows = buildPlatforms();
+  let row = rows.find((r) => r.id === name);
+  if (!row) {
+    const matches = rows.filter((r) => aliasesFor(r).includes(name));
+    if (matches.length === 0) {
+      die(`未知平台：${name}（已注册平台：${rows.map((r) => r.id).join(' ')}）`);
+    }
+    if (matches.length > 1) {
+      die(`平台名有歧义：${name} 同时匹配 ${matches.map((r) => r.id).join(' ')}，请用平台 id 指定`);
+    }
+    row = matches[0];
+  }
+  if (row.state !== 'ok') {
+    die(`平台 ${row.id} 不可用：${row.state}（worktree=${row.worktree} branch=${row.branch}；请先对齐 .agent/config/platforms.json 与实际 worktree）`);
+  }
+  if (!branchExists(row.branch)) die(`平台分支不存在：${row.branch}`);
+  if (!isDir(row.worktree)) die(`平台 worktree 目录不存在：${row.worktree}`);
+  return row;
+}
+
+function platformBranchLookup(id) {
+  if (!id) return '';
+  const row = buildPlatforms().find((r) => r.id === id);
+  return row && row.state === 'ok' ? row.branch : '';
+}
+
+// ============================ git 细粒度查询 ============================
+
+function worktreeState(wt) {
+  if (!wt || !isDir(wt)) return 'missing';
+  const r = git(['-C', wt, 'status', '--porcelain']);
+  if (r.status !== 0) return 'missing';
+  return r.stdout.trim() === '' ? 'clean' : 'dirty';
+}
+
+function branchExists(branch) {
+  return gitQuiet(['-C', ROOT, 'show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
+}
+
+function isAncestor(a, b) {
+  return gitQuiet(['-C', ROOT, 'merge-base', '--is-ancestor', a, b]);
+}
+
+function revParse(rev) {
+  const r = git(['-C', ROOT, 'rev-parse', '--verify', '--quiet', `${rev}^{commit}`]);
+  return r.status === 0 ? r.stdout.trim() : '';
+}
+
+function revListCount(range) {
+  const r = git(['-C', ROOT, 'rev-list', '--count', range]);
+  return r.status === 0 ? Number.parseInt(r.stdout.trim(), 10) || 0 : 0;
+}
+
+function mergeInProgress(wt) {
+  const r = git(['-C', wt, 'rev-parse', '--path-format=absolute', '--git-path', 'MERGE_HEAD']);
+  if (r.status !== 0) return false;
+  return isFile(r.stdout.trim());
+}
+
+function relToRoot(p) {
+  if (!p) return '';
+  const prefix = `${ROOT}${path.sep}`;
+  return p.startsWith(prefix) ? p.slice(prefix.length) : p;
+}
+
+function currentBranch(cwd = process.cwd()) {
+  return git(['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim();
+}
+
+function gitCommonDir() {
+  return gitOut(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim();
+}
+
+// ============================ 并发安全 ============================
+// registry 的「读—改—写」走互斥锁 + 原子替换（tmp + rename），
+// 避免多 agent 同时 create / finish 时互相覆盖（不做文件级锁，worktree 已保证物理隔离）。
+
+function registryLockPath() {
+  return path.join(STATE_DIR, 'locks', 'registry.lock');
+}
+
+function withRegistryLock(fn, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 15000;
+  const staleMs = opts.staleMs ?? 120000;
+  const lockPath = registryLockPath();
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const started = Date.now();
+  for (;;) {
+    try {
+      fs.mkdirSync(lockPath); // mkdir 是原子操作
+      fs.writeFileSync(path.join(lockPath, 'owner'), `pid=${process.pid}\nat=${new Date().toISOString()}\n`);
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let stale = false;
+      try {
+        stale = Date.now() - fs.statSync(lockPath).mtimeMs > staleMs;
+      } catch {
+        stale = true;
+      }
+      if (stale) {
+        try {
+          fs.rmSync(lockPath, { recursive: true, force: true });
+        } catch {
+          /* 抢占失败则下一轮重试 */
+        }
+        continue;
+      }
+      if (Date.now() - started > timeoutMs) {
+        die(`任务注册表被其他进程锁定：${lockPath}\n等待 ${Math.round(timeoutMs / 1000)}s 未释放；确认无残留进程后删除该目录重试`);
+      }
+      sleepMs(50);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    } catch {
+      /* 锁释放失败不影响主流程 */
+    }
+  }
+}
+
+function writeJsonAtomic(file, obj) {
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`);
+  fs.renameSync(tmp, file);
+}
+
+// ============================ 任务状态机 ============================
+
+const STATUSES = ['created', 'active', 'ready', 'blocked', 'conflict', 'integrating', 'merged', 'failed', 'cancelled'];
+// 未结束状态：参与 scope 重叠判定
+const OPEN_STATUSES = new Set(['created', 'active', 'ready', 'blocked', 'conflict', 'integrating']);
+
+// ============================ 任务注册表 ============================
+
+const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function validateSlug(kind, v) {
+  if (!v) die(`${kind} 不能为空`);
+  if (v.includes('/') || v.includes('..')) die(`非法 ${kind}：${v}`);
+  if (!SLUG_RE.test(v)) die(`非法 ${kind}：${v}（仅允许字母/数字/._-，且以字母或数字开头）`);
+}
+
+function taskPath(id) {
+  return path.join(TASKS_DIR, `${id}.json`);
+}
+
+function normalizeTask(task) {
+  const t = { ...task };
+  t.allowed_paths = Array.isArray(t.allowed_paths) ? t.allowed_paths : [];
+  t.requirements = Array.isArray(t.requirements) ? t.requirements : [];
+  t.status = t.status || 'active';
+  return t;
+}
+
+function readTask(id) {
+  validateSlug('task id', id);
+  const file = taskPath(id);
+  if (!isFile(file)) die(`任务不存在：${id}（未见 ${file}）`);
+  let task;
+  try {
+    task = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    die(`任务元数据不是合法 JSON：${file}（${e.message}）`);
+  }
+  for (const k of ['id', 'task_branch', 'worktree']) {
+    if (!task[k]) die(`任务元数据缺字段 ${k}：${file}`);
+  }
+  const t = normalizeTask(task);
+  t.file = file;
+  return t;
+}
+
+function writeTask(task) {
+  const file = task.file || taskPath(task.id);
+  const out = { ...task };
+  delete out.file;
+  out.updated_at = new Date().toISOString();
+  writeJsonAtomic(file, out);
+}
+
+function updateTask(id, patch) {
+  return withRegistryLock(() => {
+    const task = readTask(id);
+    const next = { ...task, ...patch };
+    writeTask(next);
+    return next;
+  });
+}
+
+function listTasks() {
+  if (!isDir(TASKS_DIR)) return [];
+  return fs
+    .readdirSync(TASKS_DIR)
+    .filter((f) => f.endsWith('.json') && !f.includes('.tmp.'))
+    .map((f) => f.slice(0, -'.json'.length))
+    .sort();
+}
+
+function effectiveTestCommand(task) {
+  if (task && typeof task.test_command === 'string' && task.test_command) return task.test_command;
+  const entry = CONFIG.platforms && task ? CONFIG.platforms[task.platform] : null;
+  if (entry && typeof entry.test_command === 'string') return entry.test_command;
+  return '';
+}
+
+// ============================ Task ID 自动命名 ============================
+
+const ID_STOPWORDS = new Set([
+  'a', 'an', 'the', 'of', 'for', 'and', 'to', 'in', 'on', 'with', 'my', 'our', 'new',
+  'implement', 'implementation', 'add', 'create', 'build', 'support', 'update', 'upgrade',
+  'fix', 'repair', 'patch', 'refactor', 'remove', 'delete', 'make', 'enable', 'allow',
+  'introduce', 'improve', 'change', 'modify', 'migrate', 'handle', 'provide', 'write', 'writeup',
+]);
+
+function slugifyTitle(text) {
+  const ascii = String(text)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '');
+  let words = ascii
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const meaningful = words.filter((w) => !ID_STOPWORDS.has(w));
+  if (meaningful.length) words = meaningful;
+  return words.slice(0, 6).join('-');
+}
+
+function nextTaskId(platformId, title) {
+  let slug = slugifyTitle(title);
+  if (slug.startsWith(`${platformId}-`)) slug = slug.slice(platformId.length + 1);
+  const base = `${platformId}-${slug || 'task'}`;
+  const taken = new Set(listTasks());
+  for (let n = 1; n <= 999; n++) {
+    const id = `${base}-${String(n).padStart(3, '0')}`;
+    if (taken.has(id)) continue;
+    return id;
+  }
+  die(`无法为 ${base} 生成 task id（序号已用尽）`);
+}
+
+// ============================ scope 重叠检测 ============================
+
+function hasMagic(p) {
+  return /[*?]/.test(p);
+}
+
+// glob 的非通配目录前缀（`src/auth/**` → `src/auth`；`src/*` → `src`）
+function globPrefix(p) {
+  const segs = p.replace(/\/+$/, '').split('/').filter(Boolean);
+  const out = [];
+  for (const s of segs) {
+    if (/[*?]/.test(s)) break;
+    out.push(s);
+  }
+  return out;
+}
+
+function segPrefix(a, b) {
+  if (a.length === 0) return true;
+  if (a.length > b.length) return false;
+  return a.every((s, i) => s === b[i]);
+}
+
+function scopesOverlap(a, b) {
+  if (a === b) return true;
+  const ma = hasMagic(a);
+  const mb = hasMagic(b);
+  if (!ma && !mb) return false; // 两条精确路径且不同 → 不重叠
+  const pa = globPrefix(a);
+  const pb = globPrefix(b);
+  return segPrefix(pa, pb) || segPrefix(pb, pa);
+}
+
+// 返回与该平台给定 scope 存在关联的未结束任务：{ task, overlap: true } 真实重叠 / false 无法判定。
+// 只在同一 platform 内比较：不同端的 worktree 是不同项目根，同名路径语义不同，跨端比较只会误报。
+function findScopeConflicts(platformId, allowed, selfId) {
+  const found = [];
+  for (const id of listTasks()) {
+    if (id === selfId) continue;
+    const t = readTask(id);
+    if (t.platform !== platformId) continue;
+    if (!OPEN_STATUSES.has(t.status)) continue;
+    const other = t.allowed_paths;
+    if (allowed.length === 0 || other.length === 0) {
+      found.push({ task: t, overlap: false, reason: 'scope 未限定，无法判定重叠' });
+      continue;
+    }
+    let hit = '';
+    for (const a of allowed) {
+      for (const b of other) {
+        if (scopesOverlap(a, b)) {
+          hit = `${a} ↔ ${b}`;
+          break;
+        }
+      }
+      if (hit) break;
+    }
+    if (hit) found.push({ task: t, overlap: true, reason: hit });
+  }
+  return found;
+}
+
+// ============================ 改动范围 ============================
+
+function collectChanges(wt, baseCommit) {
+  const set = new Set();
+  const push = (text) => {
+    for (const l of lines(text)) set.add(l);
+  };
+  push(git(['-C', wt, 'ls-files', '--others', '--exclude-standard']).stdout);
+  push(git(['-C', wt, 'diff', '--name-only']).stdout);
+  push(git(['-C', wt, 'diff', '--cached', '--name-only']).stdout);
+  if (baseCommit && revParse(baseCommit)) {
+    push(git(['-C', wt, 'diff', '--name-only', baseCommit, 'HEAD']).stdout);
+  }
+  return [...set];
+}
+
+function globToRegExp(pattern) {
+  let re = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        re += '.*';
+        i++;
+      } else {
+        re += '[^/]*';
+      }
+    } else if (c === '?') {
+      re += '[^/]';
+    } else if ('\\^$.|+()[]{}'.includes(c)) {
+      re += `\\${c}`;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function matchAllowed(pattern, p) {
+  if (pattern === '**') return true;
+  if (globToRegExp(pattern).test(p)) return true;
+  return globToRegExp(`${pattern}/**`).test(p);
+}
+
+function scopeUnexpected(allowed, changed) {
+  if (allowed.length === 0) return [];
+  return changed.filter((p) => !allowed.some((pat) => matchAllowed(pat, p)));
+}
+
+function allowedBlock(allowed, indent = '  ') {
+  if (allowed.length === 0) return `${indent}（未限定：allowed_paths 为空 = 不检查范围）`;
+  return allowed.map((a) => `${indent}${a}`).join('\n');
+}
+
+// ============================ TASK.md（任务上下文） ============================
+
+function taskContextPath(worktree) {
+  return path.join(worktree, '.agent', 'TASK.md');
+}
+
+// .agent/TASK.md 属任务动态上下文：写进 git common dir 的 info/exclude，不进业务提交
+function ensureTaskContextExcluded() {
+  const infoDir = path.join(gitCommonDir(), 'info');
+  const file = path.join(infoDir, 'exclude');
+  const marker = '.agent/TASK.md';
+  const current = isFile(file) ? fs.readFileSync(file, 'utf8') : '';
+  if (current.split('\n').some((l) => l.trim() === marker)) return;
+  fs.mkdirSync(infoDir, { recursive: true });
+  const header = '# agentctl：任务 worktree 内的当前任务上下文（动态状态，不进业务提交）\n';
+  const next = current.endsWith('\n') || current === '' ? `${current}${header}${marker}\n` : `${current}\n${header}${marker}\n`;
+  fs.writeFileSync(file, next);
+}
+
+function taskContextContent(task) {
+  const reqs = task.requirements.length ? task.requirements : [task.title];
+  const others = buildPlatforms()
+    .filter((r) => r.id !== task.platform && r.worktree)
+    .map((r) => `  - ${r.id}: ${r.worktree}${r.branch ? ` @ ${r.branch}` : ''}`);
+  const scope =
+    task.allowed_paths.length > 0
+      ? `Allowed paths:\n${task.allowed_paths.map((p) => `- ${p}`).join('\n')}`
+      : 'Allowed paths: 未限定（提交前必须用 `agentctl task check` 校验实际改动，不得触碰无关模块）';
+  return `# Current Task
+
+Task ID: ${task.id}
+Platform: ${task.platform}
+Agent: ${task.agent}
+Base Branch: ${task.base_branch}
+Task Branch: ${task.task_branch}
+Worktree: ${task.worktree}
+Status: ${task.status}
+Created: ${task.created_at}
+
+## Objective
+
+${task.objective || task.title}
+
+## Requirements
+
+${reqs.map((r) => `- ${r}`).join('\n')}
+
+## Scope
+
+${scope}
+
+## Restrictions
+
+- 只在本任务 Scope 内改动；越界改动即使有用也不提交。
+- 不要修改其他平台 / 其他 worktree：
+${others.length ? others.join('\n') : '  - （本次仅注册了一个平台）'}
+- 不要切换到其他 Task Worktree，也不要在平台 worktree 内开发。
+- 不要 reset / checkout / discard 无关改动：禁 \`git reset --hard\`、\`git clean\`、\`git checkout -- .\`、\`git stash\`。
+- 不要自行把任务分支并入平台分支（集成由 \`agentctl task integrate\` 在平台 worktree 内完成）。
+
+## Completion Criteria
+
+- 相关测试通过（\`agentctl task finish\` 会按平台 test_command 校验）。
+- \`git diff\` 复核过（\`agentctl task diff ${task.id}\`）。
+- 无越界文件（\`agentctl task check ${task.id}\` 通过）。
+- 改动已提交在任务分支 \`${task.task_branch}\`。
+- 不并入平台分支，等待 Root Coordinator 执行 merge-check / integrate。
+
+## Commands
+
+- agentctl task check ${task.id}
+- agentctl task diff ${task.id} --stat
+- agentctl task finish ${task.id}
+- agentctl task show ${task.id}
+`;
+}
+
+function writeTaskContext(task) {
+  ensureTaskContextExcluded();
+  const file = taskContextPath(task.worktree);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, taskContextContent(task));
+  fs.renameSync(tmp, file);
+  return file;
+}
+
+// ============================ AgentRunner ============================
+// 只做「发现 + 构造启动命令 + 启动」，不重新实现任何 agent 自身能力。
+// 内置模板来自本机 CLI 的 --help 实测；未实测的 CLI 必须由 .agent/config/agents.json 声明，
+// 不猜测参数（猜错会把 agent 引到错误的目录 / 错误的会话）。
+
+const BUILTIN_RUNNERS = {
+  omp: {
+    name: 'omp',
+    command: 'omp',
+    note: 'omp v18.2.5 实测：--cwd=<dir> 指定工作目录，-p/--print 非交互处理 prompt 后退出，--auto-approve 跳过工具批准（非交互自动化必需）',
+    build: (ctx) => ({ command: 'omp', args: ['--cwd', ctx.worktree, '-p', '--auto-approve', ctx.prompt] }),
+  },
+  opencode: {
+    name: 'opencode',
+    command: 'opencode',
+    note: 'opencode 实测：`opencode run [message..]` 非交互执行，--dir 指定运行目录',
+    build: (ctx) => ({ command: 'opencode', args: ['run', '--dir', ctx.worktree, ctx.prompt] }),
+  },
+  codex: {
+    name: 'codex',
+    command: 'codex',
+    note: '本机未安装，参数未实测；如需自动启动，在 .agent/config/agents.json 声明 { command, args }',
+    build: null,
+  },
+  claude: {
+    name: 'claude',
+    command: 'claude',
+    note: '本机未安装，参数未实测；如需自动启动，在 .agent/config/agents.json 声明 { command, args }',
+    build: null,
+  },
+};
+
+function whichCommand(cmd) {
+  if (!cmd) return '';
+  if (cmd.includes(path.sep)) return isFile(cmd) ? cmd : '';
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const exts = process.platform === 'win32' ? (process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';') : [''];
+  for (const d of dirs) {
+    for (const ext of exts) {
+      const p = path.join(d, `${cmd}${ext}`);
+      if (isFile(p)) return p;
+    }
+  }
+  return '';
+}
+
+function runnerFor(agentName) {
+  const declared = AGENT_CONFIG && typeof AGENT_CONFIG[agentName] === 'object' && AGENT_CONFIG[agentName] ? AGENT_CONFIG[agentName] : null;
+  const builtin = BUILTIN_RUNNERS[agentName] || null;
+  const command = (declared && typeof declared.command === 'string' && declared.command) || (builtin && builtin.command) || agentName;
+  const argsTemplate = declared && Array.isArray(declared.args) ? declared.args.filter((a) => typeof a === 'string') : null;
+  const path_ = whichCommand(command);
+  return {
+    name: agentName,
+    command,
+    path: path_,
+    detected: Boolean(path_),
+    provider: declared ? 'project-config' : builtin ? 'builtin' : 'unknown',
+    note: builtin ? builtin.note : '未内置该 agent 的启动模板：请在 .agent/config/agents.json 声明 { command, args }',
+    build(ctx) {
+      if (argsTemplate) {
+        return {
+          command,
+          args: argsTemplate.map((a) => a.replaceAll('{worktree}', ctx.worktree).replaceAll('{prompt}', ctx.prompt)),
+        };
+      }
+      if (builtin && builtin.build) return builtin.build(ctx);
+      return null;
+    },
+  };
+}
+
+function taskPrompt(task) {
+  return [
+    `你是本任务的 Worker，工作目录是 ${task.worktree}（任务分支 ${task.task_branch}）。`,
+    `先读 ${taskContextPath(task.worktree)}（当前任务上下文），再开始实现。`,
+    `需求：${task.objective || task.title}`,
+    task.requirements.length ? `要求：\n${task.requirements.map((r) => `- ${r}`).join('\n')}` : '',
+    task.allowed_paths.length ? `只允许改动：${task.allowed_paths.join(', ')}` : '',
+    `完成后在任务 worktree 内提交，并运行 agentctl task finish ${task.id}（不要并入平台分支）。`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function buildRunnerCommand(task) {
+  const runner = runnerFor(task.agent);
+  if (!runner.detected) {
+    return { ok: false, runner, reason: `未检测到可执行文件：${runner.command}` };
+  }
+  const built = runner.build({ worktree: task.worktree, prompt: taskPrompt(task) });
+  if (!built) return { ok: false, runner, reason: runner.note };
+  return { ok: true, runner, command: built.command, args: built.args };
+}
+
+function cmdAgentList(argv) {
+  parseFlags(argv);
+  const names = [...new Set([...Object.keys(BUILTIN_RUNNERS), ...Object.keys(AGENT_CONFIG)])];
+  const rows = names.map((n) => {
+    const r = runnerFor(n);
+    return { agent: n, detected: r.detected, path: r.path, provider: r.provider, note: r.note };
+  });
+  if (JSON_OUT) {
+    note(JSON.stringify({ agents: rows }, null, 2));
+    return;
+  }
+  for (const r of rows) {
+    note(`${r.agent}: ${r.detected ? 'detected' : 'not found'}${r.path ? `（${r.path}）` : ''}　[${r.provider}]`);
+    note(`  ${r.note}`);
+  }
+}
+
+// ============================ 输出表格 ============================
+
+function printTable(headers, rows) {
+  const all = [headers, ...rows];
+  const widths = headers.map((_, c) => Math.max(...all.map((r) => String(r[c] ?? '').length)));
+  for (const r of all) {
+    note(r.map((cell, c) => String(cell ?? '').padEnd(widths[c] + 2)).join('').trimEnd());
+  }
+}
+
+// ============================ 参数解析 ============================
+
+let JSON_OUT = false;
+
+function parseFlags(argv, { value = [], bool = [] } = {}) {
+  const valueSet = new Set(value);
+  const boolSet = new Set(bool);
+  const vals = {};
+  const flags = new Set();
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') {
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
+    if (!a.startsWith('--')) {
+      positional.push(a);
+      continue;
+    }
+    let key = a;
+    let inline = null;
+    const eq = a.indexOf('=');
+    if (eq !== -1) {
+      key = a.slice(0, eq);
+      inline = a.slice(eq + 1);
+    }
+    if (valueSet.has(key)) {
+      if (inline !== null) {
+        vals[key] = inline;
+      } else {
+        if (i + 1 >= argv.length) die(`${key} 需要参数`);
+        vals[key] = argv[++i];
+      }
+    } else if (boolSet.has(key)) {
+      if (inline !== null) die(`${key} 不接受参数值`);
+      flags.add(key);
+    } else {
+      usageError(`未知参数：${a}`);
+    }
+  }
+  return { vals, flags, positional };
+}
+
+function splitList(raw) {
+  return [
+    ...new Set(
+      String(raw || '')
+        .split(/[;\n]/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function parseAllowedPaths(raw) {
+  const out = [];
+  for (const item of splitList(raw)) {
+    for (const p of item.split(',')) {
+      const v = p.trim();
+      if (v) out.push(v);
+    }
+  }
+  return [...new Set(out)];
+}
+
+// ============================ platform list ============================
+
+function platformRowsForOutput() {
+  return buildPlatforms().map((r) => ({
+    id: r.id,
+    worktree: r.worktree,
+    branch: r.branch,
+    source: r.source,
+    state: r.state,
+    live: worktreeState(r.worktree),
+    aliases: aliasesFor(r),
+  }));
+}
+
+function cmdPlatformList() {
+  const rows = platformRowsForOutput();
+  if (JSON_OUT) {
+    note(JSON.stringify({
+      hub: ROOT,
+      hub_branch: currentBranch(ROOT),
+      worktree_root: WORKTREE_ROOT,
+      platforms: rows,
+    }, null, 2));
+    return;
+  }
+  printTable(
+    ['PLATFORM', 'WORKTREE', 'BRANCH', 'SOURCE', 'STATE', 'LIVE'],
+    rows.map((r) => [r.id, relToRoot(r.worktree), r.branch, r.source, r.state, r.live]),
+  );
+  note('');
+  note('平台 worktree = 平台级 integration 边界（merge / test / review / release）；agent 开发请在任务 worktree 内进行。');
+  note(`仓库枢纽：${ROOT}（${currentBranch(ROOT)}）　任务 worktree 根：${WORKTREE_ROOT}`);
+}
+
+// ============================ task create ============================
+
+function warnIfInPlatformWorktree() {
+  const cwd = normalizePath(process.cwd());
+  for (const row of buildPlatforms()) {
+    if (!row.worktree) continue;
+    if (isUnder(cwd, row.worktree)) {
+      warn(`当前目录位于平台 worktree（${row.id}：${row.worktree}）内。平台 worktree 只做 integration / review / test / release，不要在平台 worktree 内开发；agent 开发目录必须是任务 worktree（${WORKTREE_ROOT}/<platform>/<task-id>）。`);
+    }
+  }
+}
+
+function cmdTaskCreate(argv) {
+  const { vals, flags } = parseFlags(argv, {
+    value: ['--platform', '--agent', '--task', '--title', '--objective', '--requirements', '--allowed-paths', '--feature', '--parent', '--test-command'],
+    bool: ['--start', '--allow-overlap', '--dry-run'],
+  });
+  const platformName = vals['--platform'];
+  const agent = vals['--agent'];
+  const title = vals['--title'];
+  if (!platformName) usageError('缺少 --platform');
+  if (!agent) usageError('缺少 --agent');
+  if (!title && !vals['--task']) usageError('缺少 --title（或显式 --task）');
+  validateSlug('agent 名', agent);
+  if (vals['--task']) validateSlug('task id', vals['--task']);
+
+  const objective = vals['--objective'] || title || vals['--task'];
+  const requirements = splitList(vals['--requirements']);
+  const allowed = parseAllowedPaths(vals['--allowed-paths']);
+  const row = resolvePlatform(platformName);
+  const baseCommit = revParse(row.branch);
+  if (!baseCommit) die(`平台分支不存在：${row.branch}`);
+  const wtPathPreview = path.join(WORKTREE_ROOT, row.id, vals['--task'] || '<auto>');
+
+  // —— 创建前的检查：平台状态、当前目录、已有任务 scope 重叠 ——
+  if (worktreeState(row.worktree) === 'dirty') {
+    warn(`平台 worktree 存在未提交改动（${row.worktree}）：本任务基于 ${row.branch} 的 HEAD（${baseCommit.slice(0, 8)}），不含这些改动；agentctl 不会改动、清理或丢弃该 worktree 的任何内容。`);
+  }
+  warnIfInPlatformWorktree();
+  warnIfInTaskWorktree();
+
+  const conflicts = findScopeConflicts(row.id, allowed, vals['--task'] || '');
+  const overlaps = conflicts.filter((c) => c.overlap);
+  const undecidable = conflicts.filter((c) => !c.overlap);
+  if (overlaps.length > 0 && !flags.has('--allow-overlap')) {
+    const body = overlaps
+      .map((c) => `Task:   ${c.task.id}\nAgent:  ${c.task.agent}\nStatus: ${c.task.status}\nScope:  ${c.task.allowed_paths.join(', ')}\n冲突:   ${c.reason}`)
+      .join('\n\n');
+    die(`已有未结束任务占用重叠 scope：\n\n${body}\n\n处理方式：复用该任务（agentctl task start ${overlaps[0].task.id}）、调整 scope，或确认确实需要并行时加 --allow-overlap。`);
+  }
+  for (const c of overlaps) {
+    warn(`scope 与 ${c.task.id}（${c.task.agent}）重叠：${c.reason}——已按 --allow-overlap 继续，冲突将在 integration 阶段由 Git 暴露。`);
+  }
+  for (const c of undecidable) {
+    warn(`无法判定与 ${c.task.id}（${c.task.agent}）的 scope 重叠：${c.reason}`);
+  }
+
+  // task id 生成 + 注册表写入 + worktree 创建在同一临界区内完成，避免并发 create 撞名
+  const result = withRegistryLock(() => {
+    const taskId = vals['--task'] || nextTaskId(row.id, title);
+    const taskBranch = `${BRANCH_PREFIX}/${agent}/${taskId}`;
+    const wtPath = path.join(WORKTREE_ROOT, row.id, taskId);
+    const file = taskPath(taskId);
+
+    if (isFile(file)) die(`任务已存在：${taskId}（${file}）`);
+    if (branchExists(taskBranch)) die(`分支已存在：${taskBranch}——先清理（agentctl task remove ${taskId} --force）或换 task id`);
+    if (fs.existsSync(wtPath)) die(`任务 worktree 目录已存在：${wtPath}——先删除或换 task id`);
+    if (isUnder(wtPath, row.worktree)) die(`任务 worktree 不能位于平台 worktree 内：${wtPath}`);
+
+    const task = {
+      id: taskId,
+      uuid: crypto.randomUUID(),
+      title: title || taskId,
+      objective,
+      requirements,
+      platform: row.id,
+      agent,
+      base_branch: row.branch,
+      base_commit: baseCommit,
+      task_branch: taskBranch,
+      worktree: wtPath,
+      worktree_rel: '',
+      status: 'active',
+      allowed_paths: allowed,
+      feature: vals['--feature'] || null,
+      parent_task: vals['--parent'] || null,
+      test_command: vals['--test-command'] || null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      finished_at: null,
+      finished_commit: null,
+      merged_at: null,
+      merged_into: null,
+      merged_commit: null,
+    };
+
+    if (flags.has('--dry-run')) return { task, created: false };
+
+    fs.mkdirSync(path.dirname(wtPath), { recursive: true });
+    fs.mkdirSync(TASKS_DIR, { recursive: true });
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+
+    const add = git(['-C', ROOT, 'worktree', 'add', '-b', taskBranch, wtPath, baseCommit]);
+    if (add.status !== 0) die(`创建任务 worktree 失败：${wtPath}\n${(add.stderr || '').trim()}`);
+    task.worktree = normalizePath(wtPath);
+    task.worktree_rel = relToRoot(task.worktree);
+
+    const contextFile = writeTaskContext(task);
+    writeTask(task);
+    return { task, created: true, contextFile };
+  });
+
+  const task = result.task;
+  if (!result.created) {
+    note('[dry-run] 将创建（未改动任何文件）：');
+    note('');
+    note(`Platform:  ${row.id}（${relToRoot(row.worktree)} @ ${row.branch}）`);
+    note(`Task ID:   ${task.id}`);
+    note(`Branch:    ${task.task_branch}`);
+    note(`Worktree:  ${wtPathPreview}`);
+    note('');
+    note(JSON.stringify(task, null, 2));
+    const planned = buildRunnerCommand(task);
+    if (planned.ok) note(`\n[dry-run] Worker 启动命令：${planned.command} ${planned.args.map(shellQuote).join(' ')}`);
+    else note(`\n[dry-run] 无法自动启动 Worker：${planned.reason}`);
+    return;
+  }
+  const contextFile = result.contextFile;
+
+  note('Task created.');
+  note('');
+  note('Platform:');
+  note(`  ${row.id}  (${relToRoot(row.worktree)} @ ${row.branch})`);
+  note('');
+  note('Agent:');
+  note(`  ${agent}`);
+  note('');
+  note('Base:');
+  note(`  ${row.branch} @ ${baseCommit.slice(0, 8)}`);
+  note('');
+  note('Task Branch:');
+  note(`  ${task.task_branch}`);
+  note('');
+  note('Worktree:');
+  note(`  ${task.worktree}`);
+  note('');
+  note('Task Context:');
+  note(`  ${contextFile}`);
+  note('');
+  note('Allowed paths:');
+  note(allowedBlock(allowed));
+  note('');
+  note('Test command:');
+  note(`  ${effectiveTestCommand(task) || '（未配置：finish 时跳过测试检查）'}`);
+  note('');
+  note('Check scope:');
+  note(`  ${SELF} task check ${task.id}`);
+  note('');
+
+  const runner = buildRunnerCommand(task);
+  if (flags.has('--start')) {
+    startWorker(task, runner);
+    return;
+  }
+  note('Start Worker:');
+  if (runner.ok) {
+    note(`  ${SELF} task start ${task.id}          # 自动启动 ${task.agent}（${runner.command}）`);
+  }
+  note('');
+  note(`  cd ${task.worktree}`);
+  note(`  ${task.agent}`);
+  note('');
+  if (!runner.ok) note(`（自动启动降级：${runner.reason}）`);
+  note(`平台 worktree（${relToRoot(row.worktree)}）只做 integration / review / release，勿在其中开发。`);
+}
+
+function warnIfInTaskWorktree() {
+  const cwd = normalizePath(process.cwd());
+  const t = taskForWorktree(cwd);
+  if (t) warn(`当前目录是任务 worktree（${t.id}）：如需在该任务内继续开发请直接开工；若要创建新任务，请回到仓库根或使用 -C 指定。`);
+}
+
+function startWorker(task, runner) {
+  if (!runner.ok) {
+    note('无法自动启动 Worker，已降级为手工启动：');
+    note('');
+    note(`  cd ${task.worktree}`);
+    note(`  ${task.agent}`);
+    note('');
+    note(`原因：${runner.reason}`);
+    return 0;
+  }
+  if (DRY_RUN) {
+    note(`[dry-run] ${runner.command} ${runner.args.map(shellQuote).join(' ')}`);
+    return 0;
+  }
+  note(`启动 Worker：${runner.command} ${runner.args.map(shellQuote).join(' ')}`);
+  note('');
+  const res = spawnSync(runner.command, runner.args, { cwd: task.worktree, stdio: 'inherit', env: process.env });
+  return res.status === null ? 1 : res.status;
+}
+
+function shellQuote(s) {
+  return /^[A-Za-z0-9_./:=@+-]+$/.test(s) ? s : `'${s.replaceAll("'", "'\\''")}'`;
+}
+
+function taskForWorktree(wt) {
+  const abs = normalizePath(wt);
+  for (const id of listTasks()) {
+    const t = readTask(id);
+    if (t.worktree === abs) return t;
+  }
+  return null;
+}
+
+// ============================ task list / show / current ============================
+
+function cmdTaskList(argv) {
+  const { vals } = parseFlags(argv, { value: ['--platform', '--agent', '--status', '--feature'] });
+  const filt = {
+    platform: vals['--platform'] || '',
+    agent: vals['--agent'] || '',
+    status: vals['--status'] || '',
+    feature: vals['--feature'] || '',
+  };
+  const tasks = listTasks()
+    .map((id) => readTask(id))
+    .filter((t) => (!filt.platform || t.platform === filt.platform)
+      && (!filt.agent || t.agent === filt.agent)
+      && (!filt.status || t.status === filt.status)
+      && (!filt.feature || (t.feature || '') === filt.feature));
+
+  if (JSON_OUT) {
+    note(JSON.stringify(tasks.map(({ file, ...rest }) => rest), null, 2));
+    return;
+  }
+  if (tasks.length === 0) {
+    note('（无匹配任务）');
+    return;
+  }
+  printTable(['ID', 'PLATFORM', 'AGENT', 'STATUS'], tasks.map((t) => [t.id, t.platform, t.agent, t.status]));
+}
+
+function taskLiveInfo(task) {
+  const wtState = worktreeState(task.worktree);
+  const hasBranch = branchExists(task.task_branch);
+  const ahead = task.base_commit ? revListCount(`${task.base_commit}..refs/heads/${task.task_branch}`) : 0;
+  const tip = hasBranch ? git(['-C', ROOT, 'rev-parse', `refs/heads/${task.task_branch}`]).stdout.trim() : '';
+  const platRow = buildPlatforms().find((r) => r.id === task.platform);
+  let platNote = '';
+  let merged = 'no';
+  if (platRow && platRow.state === 'ok') {
+    platNote = `${relToRoot(platRow.worktree)} @ ${platRow.branch}`;
+    // 只有任务分支确实领先 base（有本任务的提交）时才谈"已并入"
+    if (ahead > 0 && tip && isAncestor(tip, platRow.branch)) merged = `yes (已并入 ${platRow.branch})`;
+  } else if (platRow) {
+    platNote = `平台不可用：${platRow.state}`;
+  }
+  return { wtState, hasBranch, ahead, merged, platNote, tip };
+}
+
+function printNext(task) {
+  const map = {
+    created: `Next: ${SELF} task start ${task.id}（把 Worker 接到该任务）`,
+    active: `Next: 在任务 worktree 内完成开发并提交，然后 ${SELF} task finish ${task.id}`,
+    ready: `Next: ${SELF} task merge-check ${task.id} → ${SELF} task integrate ${task.id}`,
+    blocked: `Next: 解除阻塞后 ${SELF} task set-status ${task.id} active`,
+    conflict: `Next: 解决平台分支上的合并冲突，然后 ${SELF} task integrate ${task.id} 收尾`,
+    integrating: `Next: ${SELF} task integrate ${task.id} 收尾合并`,
+    merged: `Next: ${SELF} task remove ${task.id}（工作区干净且已并入平台分支时回收）`,
+    failed: `Next: 排查失败原因后 ${SELF} task set-status ${task.id} active 重试，或 ${SELF} task remove ${task.id} --force`,
+    cancelled: `Next: ${SELF} task remove ${task.id} --force（回收工作区与分支）`,
+  };
+  note(map[task.status] || `Next: 状态未知（${task.status}），检查任务元数据`);
+}
+
+function cmdTaskShow(argv) {
+  const { positional } = parseFlags(argv);
+  const id = positional[0];
+  if (!id) usageError('task show 需要 task id');
+  const task = readTask(id);
+  const live = taskLiveInfo(task);
+
+  if (JSON_OUT) {
+    const { file, ...rest } = task;
+    note(JSON.stringify({
+      ...rest,
+      live_worktree: live.wtState,
+      live_branch: live.hasBranch,
+      commits_ahead: live.ahead,
+      merged: live.merged,
+      task_context: taskContextPath(task.worktree),
+      task_context_exists: isFile(taskContextPath(task.worktree)),
+    }, null, 2));
+    return;
+  }
+
+  note(`Task:       ${task.id}`);
+  note(`UUID:       ${task.uuid || '—'}`);
+  note(`Title:      ${task.title}`);
+  note(`Platform:   ${task.platform}${live.platNote ? `  (${live.platNote})` : ''}`);
+  note(`Agent:      ${task.agent}`);
+  note(`Task Branch: ${task.task_branch}`);
+  note(`Worktree:   ${task.worktree}`);
+  note(`Base:       ${task.base_branch} @ ${(task.base_commit || '').slice(0, 8)}`);
+  note(`Status:     ${task.status}`);
+  note(`Feature:    ${task.feature || '—'}`);
+  note(`Parent:     ${task.parent_task || '—'}`);
+  note(`Created:    ${task.created_at}`);
+  note(`Updated:    ${task.updated_at || '—'}`);
+  if (task.finished_commit) note(`Finished:   ${task.finished_commit.slice(0, 8)}`);
+  if (task.merged_into) note(`Merged:     ${(task.merged_commit || '').slice(0, 8)} → ${task.merged_into}`);
+  note(`Test cmd:   ${effectiveTestCommand(task) || '—'}`);
+  note('Allowed paths:');
+  note(allowedBlock(task.allowed_paths));
+  if (task.requirements.length) {
+    note('Requirements:');
+    note(task.requirements.map((r) => `  - ${r}`).join('\n'));
+  }
+  note('Live state:');
+  note(`  worktree:      ${live.wtState}`);
+  note(`  branch:        ${live.hasBranch ? 'yes' : 'no'}`);
+  note(`  commits ahead: ${live.ahead}`);
+  note(`  merged:        ${live.merged}`);
+  note(`  task context:  ${isFile(taskContextPath(task.worktree)) ? 'yes' : 'no'}（${taskContextPath(task.worktree)}）`);
+  note('');
+  printNext(task);
+}
+
+// 当前 worktree 是否处于某个任务中（Worker Mode）还是协调模式（Coordinator Mode）
+function cmdTaskCurrent(argv) {
+  parseFlags(argv);
+  const cwd = normalizePath(process.cwd());
+  const task = taskForWorktree(cwd);
+  const contextFile = taskContextPath(cwd);
+  const hasContext = isFile(contextFile);
+  const mode = task && hasContext ? 'worker' : 'coordinator';
+  if (JSON_OUT) {
+    note(JSON.stringify({ mode, cwd, task: task ? task.id : null, task_context: hasContext ? contextFile : null }, null, 2));
+    return;
+  }
+  if (mode === 'worker') {
+    note(`Mode: worker（当前 worktree 属于任务 ${task.id}，任务上下文 ${contextFile}）`);
+    note(`Platform: ${task.platform}　Agent: ${task.agent}　Status: ${task.status}`);
+    note(`Scope: ${task.allowed_paths.length ? task.allowed_paths.join(', ') : '未限定'}`);
+    note('');
+    note(`下一步：在 ${cwd} 内实现并提交，然后 ${SELF} task finish ${task.id}`);
+    return;
+  }
+  note(`Mode: coordinator（当前 worktree 没有任务上下文，目录 ${cwd}）`);
+  note('收到实现类需求时：先 agentctl platform list 与 agentctl task list，判断平台与 scope 冲突，再 agentctl task create 建任务 worktree。');
+}
+
+// ============================ task check ============================
+
+function cmdTaskCheck(argv) {
+  const { positional } = parseFlags(argv);
+  const id = positional[0];
+  if (!id) usageError('task check 需要 task id');
+  const task = readTask(id);
+  if (!isDir(task.worktree)) die(`任务 worktree 不存在：${task.worktree}`);
+  if (!gitQuiet(['-C', task.worktree, 'rev-parse', '--git-dir'])) {
+    die(`任务 worktree 不是有效 git 工作区：${task.worktree}`);
+  }
+
+  const changed = collectChanges(task.worktree, task.base_commit);
+  const unexpected = scopeUnexpected(task.allowed_paths, changed);
+  const ok = unexpected.length === 0;
+
+  if (JSON_OUT) {
+    note(JSON.stringify({ id: task.id, ok, allowed_paths: task.allowed_paths, changed, unexpected }, null, 2));
+    process.exit(ok ? 0 : 1);
+  }
+
+  if (ok) {
+    note(`Task check: ${task.id}`);
+    note('Allowed paths:');
+    note(allowedBlock(task.allowed_paths));
+    note(`Changed files: ${changed.length}`);
+    note('Result: OK — 改动均在 allowed_paths 内');
+    return;
+  }
+
+  process.stderr.write('ERROR:\nTask modified files outside allowed scope.\n\n');
+  process.stderr.write(`Task:\n  ${task.id}\n\n`);
+  process.stderr.write(`Allowed:\n${allowedBlock(task.allowed_paths)}\n\n`);
+  process.stderr.write(`Unexpected files:\n${unexpected.map((u) => `  ${u}`).join('\n')}\n\n`);
+  process.stderr.write(`Changed files (${changed.length}):\n${changed.map((c) => `  ${c}`).join('\n')}\n`);
+  process.exit(1);
+}
+
+// ============================ task diff ============================
+
+function cmdTaskDiff(argv) {
+  const { flags, positional } = parseFlags(argv, { bool: ['--stat', '--name-only', '--working'] });
+  const id = positional[0];
+  if (!id) usageError('task diff 需要 task id');
+  const task = readTask(id);
+  if (!isDir(task.worktree)) die(`任务 worktree 不存在：${task.worktree}`);
+
+  const opts = [];
+  if (flags.has('--stat')) opts.push('--stat');
+  if (flags.has('--name-only')) opts.push('--name-only');
+
+  const base = git(['-C', task.worktree, 'diff', ...opts, `${task.base_commit}..HEAD`]);
+  process.stdout.write(base.stdout);
+  if (flags.has('--working')) {
+    note('');
+    note('--- 工作区未提交改动（相对 HEAD）---');
+    process.stdout.write(git(['-C', task.worktree, 'diff', ...opts, 'HEAD']).stdout);
+    if (git(['-C', task.worktree, 'diff', '--cached', '--name-only']).stdout.trim() !== '') {
+      note('');
+      note('--- 已暂存（diff --cached）---');
+      process.stdout.write(git(['-C', task.worktree, 'diff', '--cached', ...opts]).stdout);
+    }
+  } else if (git(['-C', task.worktree, 'status', '--porcelain']).stdout.trim() !== '') {
+    note('');
+    note('（任务 worktree 存在未提交改动；用 --working 查看）');
+  }
+}
+
+// ============================ task finish ============================
+
+function cmdTaskFinish(argv) {
+  const { vals, flags, positional } = parseFlags(argv, { value: ['--test-command'], bool: ['--no-test'] });
+  const id = positional[0];
+  if (!id) usageError('task finish 需要 task id');
+  const task = readTask(id);
+  const failures = [];
+
+  note(`Task finish: ${task.id}`);
+  note('');
+
+  // [1/5] worktree 与分支
+  let ok1 = true;
+  const wtState = worktreeState(task.worktree);
+  if (wtState === 'missing') {
+    ok1 = false;
+    failures.push(`任务 worktree 不存在：${task.worktree}`);
+  } else if (!branchExists(task.task_branch)) {
+    ok1 = false;
+    failures.push(`任务分支不存在：${task.task_branch}`);
+  } else {
+    const headRef = currentBranch(task.worktree);
+    if (headRef !== task.task_branch) {
+      ok1 = false;
+      failures.push(`任务 worktree 当前检出分支是 ${headRef}，期望 ${task.task_branch}`);
+    }
+  }
+  note(`  [1/5] worktree 与分支：${okFail(ok1)}`);
+
+  // [2/5] 无未提交改动
+  const dirty = isDir(task.worktree) && git(['-C', task.worktree, 'status', '--porcelain']).stdout.trim() !== '';
+  if (dirty) failures.push('任务 worktree 存在未提交改动（含未跟踪文件）：agentctl 不会丢弃它们，请先提交或清理');
+  note(`  [2/5] 无未提交改动：${okFail(!dirty)}`);
+
+  // [3/5] 改动范围
+  const changed = collectChanges(task.worktree, task.base_commit);
+  const unexpected = scopeUnexpected(task.allowed_paths, changed);
+  for (const u of unexpected) failures.push(`越界文件：${u}`);
+  note(`  [3/5] allowed_paths 范围（${changed.length} 个改动文件）：${okFail(unexpected.length === 0)}`);
+
+  // [4/5] 至少一个 commit
+  const ahead = task.base_commit ? revListCount(`${task.base_commit}..refs/heads/${task.task_branch}`) : 0;
+  if (ahead <= 0) failures.push(`任务分支相对 base（${(task.base_commit || '').slice(0, 8)}）没有任何 commit`);
+  note(`  [4/5] 提交数（base 之后）：${ahead}（${okFail(ahead > 0)}）`);
+
+  // [5/5] 测试
+  let testState;
+  let testCommand = '';
+  if (flags.has('--no-test')) {
+    testState = 'skipped（--no-test）';
+  } else {
+    testCommand = vals['--test-command'] !== undefined ? vals['--test-command'] : effectiveTestCommand(task);
+    if (!testCommand) {
+      testState = 'skipped（未配置测试命令）';
+    } else {
+      note(`  [5/5] 测试：${testCommand}`);
+      note('');
+      const res = spawnSync('bash', ['-c', testCommand], { cwd: task.worktree, stdio: 'inherit', env: process.env });
+      const rc = res.status === null ? 1 : res.status;
+      note('');
+      if (rc === 0) {
+        testState = `OK（${testCommand}）`;
+      } else {
+        testState = `FAIL（${testCommand}，退出码 ${rc}）`;
+        failures.push(`测试未通过：${testCommand}（退出码 ${rc}）`);
+      }
+    }
+  }
+  note(`  [5/5] 测试：${testState}`);
+  note('');
+
+  if (failures.length > 0) {
+    process.stderr.write('ERROR:\nfinish 被拒绝：未修改任何文件、未丢弃任何改动。\n\n');
+    process.stderr.write(`Failures:\n${failures.map((f) => `  ${f}`).join('\n')}\n`);
+    process.exit(1);
+  }
+
+  const tip = git(['-C', ROOT, 'rev-parse', `refs/heads/${task.task_branch}`]).stdout.trim();
+  const updated = updateTask(task.id, {
+    status: 'ready',
+    finished_at: new Date().toISOString(),
+    finished_commit: tip,
+  });
+
+  const summary = {
+    task: updated.id,
+    platform: updated.platform,
+    agent: updated.agent,
+    task_branch: updated.task_branch,
+    worktree: updated.worktree,
+    changed_files: changed,
+    tests: testState,
+    commit: tip,
+    commit_short: tip.slice(0, 8),
+    status: 'ready for integration',
+  };
+  if (JSON_OUT) {
+    note(JSON.stringify(summary, null, 2));
+    return;
+  }
+
+  note('Task completed.');
+  note('');
+  note(`Task:      ${summary.task}`);
+  note(`Platform:  ${summary.platform}`);
+  note(`Agent:     ${summary.agent}`);
+  note(`Branch:    ${summary.task_branch}`);
+  note(`Worktree:  ${summary.worktree}`);
+  note('Changed files:');
+  note(changed.length ? changed.map((c) => `  ${c}`).join('\n') : '  （无）');
+  note(`Tests:     ${summary.tests}`);
+  note(`Commit:    ${summary.commit_short}`);
+  note(`Status:    ${summary.status}`);
+  note('');
+  note('Next:');
+  note(`  ${SELF} task merge-check ${task.id}`);
+  note(`  ${SELF} task integrate ${task.id}`);
+}
+
+// ============================ task set-status ============================
+
+function cmdTaskSetStatus(argv) {
+  const { vals, positional } = parseFlags(argv, { value: ['--note'] });
+  const id = positional[0];
+  const status = positional[1];
+  if (!id || !status) usageError('task set-status 需要 <task id> <status>');
+  if (!STATUSES.includes(status)) die(`非法状态：${status}（合法值：${STATUSES.join(' / ')}）`);
+  const task = readTask(id);
+  const updated = updateTask(id, { status, status_note: vals['--note'] || null });
+  note(`任务 ${task.id} 状态：${task.status} → ${updated.status}${vals['--note'] ? `（${vals['--note']}）` : ''}`);
+}
+
+// ============================ task start ============================
+
+function cmdTaskStart(argv) {
+  const { flags, positional } = parseFlags(argv, { bool: ['--dry-run'] });
+  const id = positional[0];
+  if (!id) usageError('task start 需要 task id');
+  const task = readTask(id);
+  if (!isDir(task.worktree)) die(`任务 worktree 不存在：${task.worktree}`);
+  if (!isFile(taskContextPath(task.worktree))) {
+    writeTaskContext(task);
+    note(`已生成任务上下文：${taskContextPath(task.worktree)}`);
+  }
+  const runner = buildRunnerCommand(task);
+  const prevDryRun = DRY_RUN;
+  if (flags.has('--dry-run')) DRY_RUN = true;
+  try {
+    const rc = startWorker(task, runner);
+    if (rc !== 0) process.exit(rc);
+  } finally {
+    DRY_RUN = prevDryRun;
+  }
+}
+
+// ============================ merge-check ============================
+
+// 只读：不动平台 worktree、不创建或移动分支
+function mergeCheckRun(platformBranch, taskBranch) {
+  const r = git(['-C', ROOT, 'merge-tree', '--write-tree', '--name-only', platformBranch, taskBranch]);
+  if (r.status === 0) return { clean: true, conflicts: [], mode: 'merge-tree' };
+  if (r.status === 1) {
+    const ls = r.stdout.split('\n');
+    const conflicts = [];
+    for (let i = 1; i < ls.length; i++) {
+      if (ls[i] === '') break;
+      conflicts.push(ls[i]);
+    }
+    return { clean: false, conflicts, mode: 'merge-tree' };
+  }
+  return mergeCheckViaWorktree(platformBranch, taskBranch);
+}
+
+// 回退路径：临时 integration worktree（旧版 git 无 merge-tree --write-tree）
+function mergeCheckViaWorktree(platformBranch, taskBranch) {
+  const tmp = path.join(STATE_DIR, 'tmp', `merge-check-${process.pid}`);
+  fs.mkdirSync(path.dirname(tmp), { recursive: true });
+  if (git(['-C', ROOT, 'worktree', 'add', '--detach', '--quiet', tmp, platformBranch]).status !== 0) {
+    die(`无法创建临时 integration worktree：${tmp}`);
+  }
+  const res = git(['-c', 'rerere.enabled=false', '-C', tmp, 'merge', '--no-commit', '--no-ff', '-m', 'merge-check', taskBranch]);
+  const unmerged = lines(git(['-C', tmp, 'diff', '--name-only', '--diff-filter=U']).stdout);
+  git(['-C', tmp, 'merge', '--abort']);
+  git(['-C', ROOT, 'worktree', 'remove', '--force', tmp]);
+  if (unmerged.length > 0) return { clean: false, conflicts: unmerged, mode: 'temp-worktree' };
+  return { clean: res.status === 0, conflicts: [], mode: 'temp-worktree' };
+}
+
+function cmdTaskMergeCheck(argv) {
+  const { positional } = parseFlags(argv);
+  const id = positional[0];
+  if (!id) usageError('task merge-check 需要 task id');
+  const task = readTask(id);
+  if (!branchExists(task.task_branch)) die(`任务分支不存在：${task.task_branch}`);
+  const row = resolvePlatform(task.platform);
+
+  const platformDirty = worktreeState(row.worktree) === 'dirty';
+  const behind = task.base_commit && revParse(task.base_commit) ? revListCount(`${task.base_commit}..refs/heads/${row.branch}`) : 0;
+  const tip = git(['-C', ROOT, 'rev-parse', `refs/heads/${task.task_branch}`]).stdout.trim();
+  const fastForward = isAncestor(row.branch, tip);
+
+  const result = mergeCheckRun(row.branch, task.task_branch);
+
+  if (JSON_OUT) {
+    note(JSON.stringify({
+      id: task.id,
+      into: row.branch,
+      from: task.task_branch,
+      clean: result.clean,
+      conflicts: result.conflicts,
+      platform_worktree: platformDirty ? 'dirty' : 'clean',
+      platform_commits_since_base: behind,
+      fast_forward: fastForward,
+      mode: result.mode,
+    }, null, 2));
+    process.exit(result.clean ? 0 : 1);
+  }
+
+  note(`Merge check: ${task.task_branch} → ${row.branch}`);
+  note(`Platform worktree: ${platformDirty ? 'dirty' : 'clean'}（${relToRoot(row.worktree)}）`);
+  note(`平台分支自任务基点以来的提交数：${behind}`);
+  if (platformDirty) {
+    warn('平台 worktree 有未提交改动：integrate 会拒绝执行，请先在其内提交或清理（agentctl 不会动你的工作区）。');
+  }
+  if (result.clean) {
+    note(`Result: CLEAN（可合并；可快进：${fastForward ? 'yes' : 'no'}）`);
+    note('');
+    note(`Next: ${SELF} task integrate ${task.id}`);
+    return;
+  }
+  note(`Result: CONFLICT（${result.mode} 判定；平台 worktree 未被改动）`);
+  note('');
+  note('Conflicted files:');
+  note(result.conflicts.map((c) => `  ${c}`).join('\n'));
+  note('');
+  note('物理隔离解决的是覆盖问题；逻辑冲突由 Git 在集成阶段暴露，需人 / agent 解决：');
+  note(`  ${SELF} task integrate ${task.id}   # 冲突时保留进行中的 merge，解决后重跑本命令收尾`);
+  process.exit(1);
+}
+
+// ============================ integrate ============================
+
+function platformCleanOrDie(row) {
+  const st = git(['-C', row.worktree, 'status', '--porcelain']).stdout;
+  if (st.trim() !== '') {
+    die(`平台 worktree 存在未提交改动，拒绝 integrate（agentctl 不会执行 reset / checkout / merge / rebase 等可能破坏你状态的操作）：\n${row.worktree}\n${st.trim()}\n\n请先在该 worktree 内提交或清理，再重试。`);
+  }
+}
+
+function cmdTaskIntegrate(argv) {
+  const { flags, positional } = parseFlags(argv, { bool: ['--force'] });
+  const id = positional[0];
+  if (!id) usageError('task integrate 需要 task id');
+  const force = flags.has('--force');
+  const task = readTask(id);
+  const row = resolvePlatform(task.platform);
+
+  if (!branchExists(task.task_branch)) die(`任务分支不存在：${task.task_branch}`);
+  if (!isDir(row.worktree)) die(`平台 worktree 不存在：${row.worktree}`);
+
+  if (task.status === 'merged') {
+    die(`任务 ${task.id} 已并入 ${task.merged_into}（${(task.merged_commit || '').slice(0, 8)}）；如需回收执行 agentctl task remove ${task.id}`);
+  }
+  if (!['ready', 'conflict', 'integrating'].includes(task.status) && !force) {
+    die(`任务状态是 ${task.status}，需先通过 finish（${SELF} task finish ${task.id}）才允许 integrate；如确认跳过检查，使用 --force`);
+  }
+
+  const headRef = currentBranch(row.worktree);
+  if (headRef !== row.branch) {
+    die(`平台 worktree 当前检出分支是 ${headRef}，期望 ${row.branch}（不在预期 worktree 内执行 merge）`);
+  }
+
+  const tip = git(['-C', ROOT, 'rev-parse', `refs/heads/${task.task_branch}`]).stdout.trim();
+  if (task.finished_commit && tip !== task.finished_commit && !force) {
+    die(`任务分支 tip 已变化（finish 时 ${task.finished_commit.slice(0, 8)}，当前 ${tip.slice(0, 8)}）：请重新 finish，或用 --force 合并未经 finish 检查的提交`);
+  }
+  if (worktreeState(task.worktree) === 'dirty') {
+    warn('任务 worktree 存在未提交改动：本次只合并任务分支，这些改动不会被合并。');
+  }
+
+  if (mergeInProgress(row.worktree)) {
+    // 进行中的 merge：仅当是本任务冲突的续做才放行
+    const mergeHead = git(['-C', row.worktree, 'rev-parse', 'MERGE_HEAD']).stdout.trim();
+    if (mergeHead !== tip) {
+      die(`平台 worktree 存在其他进行中的 merge（MERGE_HEAD=${mergeHead.slice(0, 8)}，本任务 ${tip.slice(0, 8)}）：请先收尾或放弃（cd ${row.worktree} && git merge --abort）`);
+    }
+    const unmerged = lines(git(['-C', row.worktree, 'diff', '--name-only', '--diff-filter=U']).stdout);
+    if (unmerged.length > 0) {
+      updateTask(task.id, { status: 'conflict' });
+      note(`Merge 仍在进行中（${task.task_branch} → ${row.branch}），以下文件冲突尚未解决：`);
+      note(unmerged.map((f) => `  ${f}`).join('\n'));
+      note('');
+      note(`解决后：cd ${row.worktree} && git add <files>，再执行 ${SELF} task integrate ${task.id} 收尾。`);
+      process.exit(1);
+    }
+    note('冲突已解决，收尾合并提交…');
+    updateTask(task.id, { status: 'integrating' });
+    const commit = git(['-C', row.worktree, 'commit', '--no-edit']);
+    if (commit.status !== 0) {
+      updateTask(task.id, { status: 'failed' });
+      die(`收尾合并提交失败（cd ${row.worktree} && git status 查看）`);
+    }
+  } else {
+    platformCleanOrDie(row);
+    note(`Integrating: ${task.task_branch} → ${row.branch}（${relToRoot(row.worktree)}）`);
+    updateTask(task.id, { status: 'integrating' });
+    const res = git(['-C', row.worktree, 'merge', '--no-ff', '-m', `merge(agent): 合并 ${task.task_branch} 至 ${row.branch}`, task.task_branch]);
+    if (res.status !== 0) {
+      if (mergeInProgress(row.worktree)) {
+        updateTask(task.id, { status: 'conflict' });
+        const conflicted = lines(git(['-C', row.worktree, 'diff', '--name-only', '--diff-filter=U']).stdout);
+        note('');
+        note('Merge CONFLICT：平台 worktree 中保留了进行中的 merge（未回退、未丢弃任何内容）。');
+        note('');
+        note('Conflicted files:');
+        note(conflicted.map((f) => `  ${f}`).join('\n'));
+        note('');
+        note(`解决后：cd ${row.worktree} && git add <files>，再执行 ${SELF} task integrate ${task.id} 收尾提交并标记 merged。`);
+        note(`放弃本次合并：cd ${row.worktree} && git merge --abort（然后 ${SELF} task set-status ${task.id} ready）`);
+        process.exit(1);
+      }
+      updateTask(task.id, { status: 'failed' });
+      die(`merge 失败（cd ${row.worktree} && git status 查看）\n${(res.stderr || res.stdout).trim()}`);
+    }
+  }
+
+  const head = git(['-C', row.worktree, 'rev-parse', 'HEAD']).stdout.trim();
+  updateTask(task.id, {
+    status: 'merged',
+    merged_at: new Date().toISOString(),
+    merged_into: row.branch,
+    merged_commit: head,
+  });
+
+  note('');
+  note(`Task ${task.id} 已并入 ${row.branch}（${head.slice(0, 8)}）。`);
+  note(`平台 worktree：${row.worktree} —— 后续由平台级测试 / 评审流程处理。`);
+  note('');
+  note('Next:');
+  note(`  cd ${row.worktree}   # 平台级 test / review / release`);
+  note(`  ${SELF} task remove ${task.id}   # 确认并入且工作区干净后回收`);
+}
+
+// ============================ task remove ============================
+
+function cmdTaskRemove(argv) {
+  const { flags, positional } = parseFlags(argv, { bool: ['--force'] });
+  const id = positional[0];
+  if (!id) usageError('task remove 需要 task id');
+  const force = flags.has('--force');
+  const task = readTask(id);
+
+  if (task.status !== 'merged' && !force) {
+    die(`任务未并入平台分支（status: ${task.status}），拒绝删除。如确认丢弃该任务与其分支，使用：agentctl task remove ${task.id} --force`);
+  }
+  if (task.status !== 'merged') {
+    warn(`任务状态为 ${task.status}（未并入平台分支）：--force 将删除其 worktree 与分支，未合并的提交只会留在 reflog 中。`);
+  }
+
+  const wtState = worktreeState(task.worktree);
+  if (wtState === 'dirty') {
+    const st = git(['-C', task.worktree, 'status', '--porcelain']).stdout.trim();
+    if (!force) {
+      die(`任务 worktree 存在未提交改动（含未跟踪文件），拒绝删除——agentctl 不会丢弃你的修改：\n${task.worktree}\n${st}\n\n如确认丢弃，使用：agentctl task remove ${task.id} --force`);
+    }
+    warn('按 --force 丢弃以下未提交改动：');
+    process.stderr.write(`${st}\n`);
+  }
+
+  if (wtState === 'missing') {
+    note(`任务 worktree 已不存在：${task.worktree}（跳过 worktree 回收）`);
+  } else {
+    const rm = git(['-C', ROOT, 'worktree', 'remove', ...(force ? ['--force'] : []), task.worktree]);
+    if (rm.status !== 0) die(`worktree 回收失败：${task.worktree}\n${(rm.stderr || '').trim()}${force ? '' : '（可用 --force）'}`);
+    note(`已回收 worktree：${task.worktree}`);
+  }
+
+  if (branchExists(task.task_branch)) {
+    const pb = platformBranchLookup(task.platform);
+    const merged = Boolean(pb) && branchExists(pb) && isAncestor(task.task_branch, pb);
+    if (!merged && !force) {
+      die(`分支 ${task.task_branch} 未确认并入 ${pb || '平台分支'}，拒绝删除（如确认丢弃，用 --force）`);
+    }
+    if (!merged) warn(`分支 ${task.task_branch} 未确认并入 ${pb || '平台分支'}，按 --force 强删`);
+    const del = git(['-C', ROOT, 'branch', '-D', task.task_branch]);
+    if (del.status !== 0) die(`分支删除失败：${task.task_branch}\n${(del.stderr || '').trim()}`);
+    note(`已删除分支：${task.task_branch}`);
+  }
+
+  fs.rmSync(task.file, { force: true });
+  note(`已删除任务记录：${task.file}`);
+}
+
+// ============================ doctor ============================
+
+function cmdDoctor(argv) {
+  parseFlags(argv);
+  const checks = [];
+  const add = (name, ok, detail) => checks.push({ name, ok, detail });
+
+  const gitVer = git(['--version']).stdout.trim();
+  add('Git', git(['--version']).status === 0, gitVer);
+  add('Node', true, process.version);
+  add('Repository', true, `${ROOT}（${currentBranch(ROOT)}）`);
+
+  const wtSupport = git(['worktree', 'list', '--porcelain']).status === 0;
+  add('Worktree support', wtSupport, wtSupport ? 'git worktree 可用' : 'git worktree 不可用');
+
+  const platforms = buildPlatforms();
+  add('Platform Worktrees', platforms.length > 0 && platforms.every((r) => r.state === 'ok'),
+    platforms.length ? `${platforms.filter((r) => r.state === 'ok').length}/${platforms.length} 可用` : '未识别到平台 worktree');
+
+  const tasks = listTasks().map((id) => readTask(id));
+  const byStatus = {};
+  for (const t of tasks) byStatus[t.status] = (byStatus[t.status] || 0) + 1;
+  add('Task Registry', isDir(TASKS_DIR) || tasks.length === 0,
+    `${tasks.length} 条任务${tasks.length ? `（${Object.entries(byStatus).map(([k, v]) => `${k}:${v}`).join(' ')}）` : ''}`);
+
+  const agentRows = [...new Set([...Object.keys(BUILTIN_RUNNERS), ...Object.keys(AGENT_CONFIG)])].map((n) => runnerFor(n));
+  const detectedAgents = agentRows.filter((r) => r.detected).map((r) => r.name);
+  add('Agent executables', detectedAgents.length > 0,
+    agentRows.map((r) => `${r.name}: ${r.detected ? 'detected' : 'not found'}`).join('　'));
+
+  const agentsMd = isFile(path.join(ROOT, 'AGENTS.md'));
+  add('AGENTS.md', agentsMd, agentsMd ? path.join(ROOT, 'AGENTS.md') : '缺少 AGENTS.md');
+
+  const cwdTask = taskForWorktree(process.cwd());
+  const contextFile = taskContextPath(normalizePath(process.cwd()));
+  const mode = cwdTask && isFile(contextFile) ? `worker（${cwdTask.id}）` : 'coordinator';
+  add('Mode', true, `${mode}　cwd=${normalizePath(process.cwd())}`);
+
+  const excludeFile = path.join(gitCommonDir(), 'info', 'exclude');
+  const excluded = isFile(excludeFile) && fs.readFileSync(excludeFile, 'utf8').split('\n').some((l) => l.trim() === '.agent/TASK.md');
+  add('Task context exclude', excluded || tasks.length === 0,
+    excluded ? `.agent/TASK.md 已在 ${excludeFile} 中排除` : '尚无任务（首次 task create 时自动写入 info/exclude）');
+
+  if (JSON_OUT) {
+    note(JSON.stringify({ root: ROOT, worktree_root: WORKTREE_ROOT, checks, platforms: platformRowsForOutput(), agents: agentRows.map((r) => ({ agent: r.name, detected: r.detected, path: r.path, provider: r.provider })) }, null, 2));
+    return;
+  }
+
+  note('Agent Task System');
+  note('');
+  for (const c of checks) {
+    note(`${c.name}: ${c.ok ? 'OK' : 'FAIL'}${c.detail ? `　${c.detail}` : ''}`);
+  }
+  note('');
+  note('Platform Worktrees:');
+  for (const r of platforms) {
+    note(`  ${r.id}: ${r.state === 'ok' ? 'OK' : `FAIL（${r.state}）`}　${relToRoot(r.worktree)} @ ${r.branch}　[${worktreeState(r.worktree)}]`);
+  }
+  note('');
+  note('Agents:');
+  for (const r of agentRows) {
+    note(`  ${r.name}: ${r.detected ? 'detected' : 'not found'}${r.detected ? `（${r.path}）` : ''}　[${r.provider}]`);
+  }
+  note('');
+  note('Task Worktrees:');
+  if (tasks.length === 0) {
+    note('  （无任务）');
+  } else {
+    for (const t of tasks) {
+      note(`  ${t.id}: ${t.status}　${t.platform}　${t.agent}　${worktreeState(t.worktree)}`);
+    }
+  }
+  note('');
+  note(`任务 worktree 根：${WORKTREE_ROOT}`);
+}
+
+// ============================ help ============================
+
+function cmdHelp() {
+  note(`agentctl ${VERSION} — Agent 任务级 worktree 管理（两级 worktree 模型的第二级）
+
+用法：
+  agentctl [-C <目录>] [--json] <命令> [参数]
+
+自检：
+  agentctl doctor                    Git / 仓库 / 平台 worktree / 任务 registry / Agent CLI / AGENTS.md
+  agentctl agent list                列出内置 Agent runner 与检测结果
+  agentctl platform list             列出平台 registry（探测 + .agent/config/platforms.json 声明）
+  agentctl task current              判断当前目录处于 Coordinator 还是 Worker 模式
+
+任务：
+  agentctl task create --platform <平台> --agent <agent> [--title <文本>] [--task <id>] [选项]
+      创建任务分支 agent/<agent>/<task-id> 与独立任务 worktree
+      <worktree_root>/<platform>/<task-id>，写入 .agent/tasks/<id>.json 与任务上下文 .agent/TASK.md。
+      task id 缺省时按标题自动生成（<平台>-<slug>-NNN，同名递增）。
+      选项：
+        --title <文本>             任务标题（自动 task id 的来源）
+        --objective <文本>         Objective（默认同 title）
+        --requirements <列表>      要求列表，分号或换行分隔
+        --allowed-paths <glob,..>  允许改动的路径（相对任务 worktree 根；空 = 不检查范围）
+        --feature <名称>           跨平台 feature 分组标记
+        --parent <名称>            feature 内父级任务标记
+        --test-command '<cmd>'     finish 时执行的测试命令（默认取平台配置）
+        --allow-overlap            与已有任务 scope 重叠时仍创建（显式确认）
+        --dry-run                  只打印将创建的内容
+        --start                    创建后立即启动 Worker（不可用时降级为打印命令）
+  agentctl task list [--platform <p>] [--agent <a>] [--status <s>] [--feature <f>]
+  agentctl task show <id>
+  agentctl task start <id> [--dry-run]      按 AgentRunner 启动 Worker
+  agentctl task check <id>                  校验实际改动是否越出 allowed_paths（越界退出码 1）
+  agentctl task diff <id> [--stat|--name-only] [--working]
+  agentctl task finish <id> [--no-test] [--test-command '<cmd>']
+      门禁：worktree 与分支正确、无未提交改动、改动未越界、至少一个 commit、测试通过。
+      通过后状态置 ready 并输出 Worker 完成摘要；不删除、不丢弃任何改动。
+  agentctl task set-status <id> <status>    标记 blocked / failed / cancelled 等
+      状态：${STATUSES.join(' / ')}
+  agentctl task merge-check <id>            只读判断能否并入平台分支（不改动平台 worktree）
+  agentctl task integrate <id> [--force]    在平台 worktree 内 --no-ff 合并任务分支
+  agentctl task remove <id> [--force]       仅 merged + 干净时回收 worktree / 分支 / 记录
+
+约定：
+  · 平台 worktree 是 integration 边界；agent 开发一律在任务 worktree 内。
+  · .agent/tasks/*.json 为运行时状态（不入库）；注册表读改写走锁 + 原子替换。
+  · 不做文件锁：覆盖由 worktree 隔离，逻辑冲突交 Git 合并。
+  · 在仓库主 checkout 或其任意 worktree 内均可运行（-C 指定目录）。`);
+}
+
+// ============================ 入口 ============================
+
+let DRY_RUN = false;
+
+function main() {
+  const argv = process.argv.slice(2);
+  const rest = [];
+  let cmd = null;
+
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (cmd === null && (a === '-C' || a === '--directory')) {
+      if (i + 1 >= argv.length) usageError('-C 需要目录参数');
+      try {
+        process.chdir(argv[++i]);
+      } catch (e) {
+        die(`无法进入目录：${argv[i]}（${e.message}）`);
+      }
+    } else if (a === '--json') {
+      JSON_OUT = true;
+    } else if (cmd === null && (a === '--version' || a === '-V')) {
+      note(`agentctl ${VERSION}`);
+      return;
+    } else if (cmd === null && (a === '--help' || a === '-h')) {
+      cmdHelp();
+      return;
+    } else if (cmd === null && !a.startsWith('-')) {
+      cmd = a;
+    } else {
+      rest.push(a);
+    }
+  }
+
+  if (!cmd || cmd === 'help') {
+    cmdHelp();
+    return;
+  }
+  if (cmd === 'version') {
+    note(`agentctl ${VERSION}`);
+    return;
+  }
+
+  ROOT = resolveRoot();
+  configInit();
+
+  if (cmd === 'doctor') return cmdDoctor(rest);
+  if (cmd === 'platform') {
+    const sub = rest[0] || 'list';
+    if (sub !== 'list') usageError(`未知子命令：platform ${sub}`);
+    return cmdPlatformList();
+  }
+  if (cmd === 'agent') {
+    const sub = rest[0] || 'list';
+    if (sub !== 'list') usageError(`未知子命令：agent ${sub}`);
+    return cmdAgentList(rest.slice(1));
+  }
+  if (cmd === 'task') {
+    const sub = rest[0];
+    const args = rest.slice(1);
+    switch (sub) {
+      case 'create': return cmdTaskCreate(args);
+      case 'list': return cmdTaskList(args);
+      case 'show': return cmdTaskShow(args);
+      case 'current': return cmdTaskCurrent(args);
+      case 'check': return cmdTaskCheck(args);
+      case 'diff': return cmdTaskDiff(args);
+      case 'finish': return cmdTaskFinish(args);
+      case 'set-status': return cmdTaskSetStatus(args);
+      case 'start': return cmdTaskStart(args);
+      case 'merge-check': return cmdTaskMergeCheck(args);
+      case 'integrate': return cmdTaskIntegrate(args);
+      case 'remove': return cmdTaskRemove(args);
+      case undefined:
+      case 'help': return cmdHelp();
+      default: usageError(`未知子命令：task ${sub}`);
+    }
+  }
+  usageError(`未知命令：${cmd}`);
+}
+
+main();
