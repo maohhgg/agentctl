@@ -3,6 +3,7 @@
 **一条任务一个 git worktree——范围强制、门禁把关、零依赖、单文件。**
 
 [![CI](https://github.com/maohhgg/agentctl/actions/workflows/ci.yml/badge.svg)](https://github.com/maohhgg/agentctl/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/maohhgg/agentctl)](https://github.com/maohhgg/agentctl/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)](package.json)
 
@@ -102,6 +103,7 @@ agentctl init                          # 一次性初始化：登记探测平台
 agentctl doctor                        # 环境自检
 
 # 建任务：codex worker，只许改 src/auth/**
+# （--agent 可省略——agentctl 会自识别当前 CLI；这里显式给出是因为命令是复制到普通终端执行的）
 agentctl task create --platform backend --agent codex \
   --title "Implement Google OAuth" \
   --requirements "login endpoint;callback;token refresh;tests" \
@@ -139,6 +141,7 @@ agentctl task remove backend-google-oauth-001       # 评审后回收 worktree �
    查在途任务与 scope 重叠。
 2. `agentctl task create --platform <p> --agent <cli> --title '…' \
       --requirements 'a;b;c' --allowed-paths '<globs>'`
+   （`--agent` 可省略——agentctl 会自识别当前 CLI；在 agent 会话内直接省略即可。）
 3. `agentctl task start <id>` 启动 worker（或按打印的目录手工启动 agent CLI）。
 4. 平台分支期间前进了：`agentctl task update-base <id>`。
 5. 评审后：`agentctl task merge-check <id>` → `agentctl task integrate <id>`

@@ -3,6 +3,7 @@
 **One git worktree per AI coding agent task — scope-enforced, gate-checked, zero dependencies, single file.**
 
 [![CI](https://github.com/maohhgg/agentctl/actions/workflows/ci.yml/badge.svg)](https://github.com/maohhgg/agentctl/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/maohhgg/agentctl)](https://github.com/maohhgg/agentctl/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)](package.json)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-ff69b4.svg)](CONTRIBUTING.md)
@@ -113,6 +114,8 @@ agentctl init                          # one-time setup: register detected platf
 agentctl doctor                        # environment self-check
 
 # create a task for a codex worker, confined to src/auth/**
+# (--agent can be omitted — agentctl self-identifies the calling CLI;
+#  explicit is shown here because this command is copied into a plain terminal)
 agentctl task create --platform backend --agent codex \
   --title "Implement Google OAuth" \
   --requirements "login endpoint;callback;token refresh;tests" \
@@ -152,6 +155,8 @@ Decide your role with `agentctl task current`:
    check in-flight tasks and scope overlaps.
 2. `agentctl task create --platform <p> --agent <cli> --title '…' \
       --requirements 'a;b;c' --allowed-paths '<globs>'`
+   (`--agent` is optional — agentctl self-identifies the calling CLI; when
+   inside an agent session, just omit it.)
 3. `agentctl task start <id>` to launch the worker (or open the agent CLI in the
    printed worktree).
 4. If the platform branch moved meanwhile: `agentctl task update-base <id>`.
