@@ -67,8 +67,13 @@ integration time. agentctl deliberately implements **no file locks**.
 - **Conflict continuation** — on conflict, `task integrate` *keeps the
   in-progress merge*, marks the task `conflict`, and tells you what to resolve;
   re-run the same command to conclude the merge commit. Nothing is reverted.
+- **Base refresh** — `task update-base` pulls the platform branch's new commits
+  into a long-running task branch with the same conflict-continuation semantics;
+  a `ready` task whose base moved returns to `active` so its gates re-run.
 - **Concurrent-safe registry** — task records are mutated under a mkdir mutex
   with atomic-rename writes; two agents can `task create` at the same instant.
+  Lost records are recoverable from a task worktree's `.agent/TASK.md`
+  (`task adopt`).
 - **Multi-platform registries** — monorepo / multi-target repos declare several
   platform worktrees with aliases and per-platform test commands; undeclared
   worktrees are auto-detected.
@@ -129,6 +134,7 @@ cd ../my-repo-agent-worktrees/backend/backend-google-oauth-001 && codex
 
 # when the worker reports done (run from anywhere in the repo):
 agentctl task check backend-google-oauth-001        # scope audit
+agentctl task update-base backend-google-oauth-001  # optional: pull newer platform commits into the task first
 agentctl task merge-check backend-google-oauth-001  # read-only merge dry-run
 agentctl task integrate backend-google-oauth-001    # --no-ff merge into the platform branch
 agentctl task remove backend-google-oauth-001       # reclaim worktree + branch after review
@@ -157,7 +163,8 @@ Decide your role with `agentctl task current`:
       --requirements 'a;b;c' --allowed-paths '<globs>'`
 3. `agentctl task start <id>` to launch the worker (or open the agent CLI in the
    printed worktree).
-4. After review: `agentctl task merge-check <id>` → `agentctl task integrate <id>`
+4. If the platform branch moved meanwhile: `agentctl task update-base <id>`.
+5. After review: `agentctl task merge-check <id>` → `agentctl task integrate <id>`
    → `agentctl task remove <id>`.
    The coordinator never edits business code directly, and never merges tasks
    into the main branch — platform worktrees are the integration boundary.
@@ -192,7 +199,9 @@ agentctl [-C <dir>] [--json] <command> [args]
 | `task start <id>` | Launch the agent CLI inside the task worktree |
 | `task check <id>` | Scope audit — exit 1 if any changed file is out of scope |
 | `task diff <id>` | Diff vs base (`--stat`, `--name-only`, `--working` for uncommitted) |
-| `task finish <id>` | Five gates → status `ready`; `--no-test` / `--test-command` |
+| `task finish <id>` | Five gates → status `ready`; `--no-test` / `--test-command` / `--timeout` |
+| `task update-base <id>` | Merge platform-branch new commits into the task branch and refresh its base (conflict-safe, `--dry-run`) |
+| `task adopt` | Rebuild a lost task record from the current worktree's `.agent/TASK.md` |
 | `task set-status <id> <status>` | Mark `blocked` / `failed` / `cancelled` / … |
 | `task merge-check <id>` | Read-only merge dry-run; exit 1 on conflict |
 | `task integrate <id>` | `--no-ff` merge into the platform branch; conflict-safe |
@@ -224,7 +233,8 @@ Open statuses (`created` … `integrating`) participate in scope-overlap detecti
       "worktree": "wt/backend",      // required: platform worktree path
       "branch": "feature/backend",   // required: its integration branch
       "aliases": ["api"],            // optional: extra names accepted by --platform
-      "test_command": "composer test" // default test gate for task finish
+      "test_command": "composer test", // default test gate for task finish
+      "test_timeout": 300              // optional: kill hung test runs after N seconds
     }
   }
 }
@@ -267,6 +277,12 @@ The space moves fast; treat the table as a snapshot of positioning, not a
 benchmark. agentctl is intentionally the **headless, enforcement-focused** member
 of the family — it composes well with review UIs and CI instead of replacing
 them. CLI messages are currently in Chinese; English output is on the roadmap.
+
+## Security
+
+agentctl executes test and runner commands defined inside the repository —
+treat repository write access as code-execution trust, the same as CI.
+Details and rules of thumb in [SECURITY.md](SECURITY.md).
 
 ## Development
 

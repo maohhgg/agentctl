@@ -60,8 +60,12 @@ checkout 时会互相覆盖文件、互相污染 git 状态——分支隔离解
 - **冲突续做**：`task integrate` 冲突时**保留进行中的 merge**、状态置
   `conflict`、打印待解决文件；解决后重跑同一条命令即收尾提交。不回退、
   不丢弃任何内容。
+- **基点刷新**：`task update-base` 把平台分支的新提交合并进长周期任务分支
+  并刷新基点（同样的冲突续做语义）；ready 任务基点变更后状态退回 active，
+  门禁重跑。
 - **并发安全注册表**：任务记录在 mkdir 互斥锁内以「临时文件 + 原子 rename」
-  读写；两个 agent 同时 `task create` 不会撞名、不会互相覆盖。
+  读写；两个 agent 同时 `task create` 不会撞名、不会互相覆盖。记录丢失时
+  可从任务 worktree 的 `.agent/TASK.md` 重建（`task adopt`）。
 - **多平台注册表**：monorepo / 多端仓库可声明多个平台 worktree（别名 +
   各自的测试命令）；未声明的 worktree 自动探测。
 - **Runner 不猜参数**：只为真实安装实测过的 CLI（`omp`、`opencode`）内置
@@ -119,6 +123,7 @@ cd ../my-repo-agent-worktrees/backend/backend-google-oauth-001 && codex
 
 # worker 完成后（在仓库内任意目录执行）：
 agentctl task check backend-google-oauth-001        # 范围审计
+agentctl task update-base backend-google-oauth-001  # 可选：先把平台分支新提交并进任务
 agentctl task merge-check backend-google-oauth-001  # 只读合并预检
 agentctl task integrate backend-google-oauth-001    # --no-ff 并入平台分支
 agentctl task remove backend-google-oauth-001       # 评审后回收 worktree 与分支
@@ -144,7 +149,8 @@ agentctl task remove backend-google-oauth-001       # 评审后回收 worktree �
 2. `agentctl task create --platform <p> --agent <cli> --title '…' \
       --requirements 'a;b;c' --allowed-paths '<globs>'`
 3. `agentctl task start <id>` 启动 worker（或按打印的目录手工启动 agent CLI）。
-4. 评审后：`agentctl task merge-check <id>` → `agentctl task integrate <id>`
+4. 平台分支期间前进了：`agentctl task update-base <id>`。
+5. 评审后：`agentctl task merge-check <id>` → `agentctl task integrate <id>`
    → `agentctl task remove <id>`。
    Coordinator 不直接改业务代码；不把任务并进 main——平台 worktree 才是
    integration 边界。
@@ -179,7 +185,9 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 | `task start <id>` | 在任务 worktree 内启动 agent CLI |
 | `task check <id>` | 范围审计——越界退出码 1 |
 | `task diff <id>` | 相对 base 的差异（`--stat` / `--name-only` / `--working`） |
-| `task finish <id>` | 五项门禁 → 状态 `ready`；`--no-test` / `--test-command` |
+| `task finish <id>` | 五项门禁 → 状态 `ready`；`--no-test` / `--test-command` / `--timeout` |
+| `task update-base <id>` | 把平台分支新提交合并进任务分支并刷新基点（冲突安全，`--dry-run`） |
+| `task adopt` | 从当前 worktree 的 `.agent/TASK.md` 重建丢失的注册表记录 |
 | `task set-status <id> <状态>` | 标记 `blocked` / `failed` / `cancelled` 等 |
 | `task merge-check <id>` | 只读合并预检；冲突退出码 1 |
 | `task integrate <id>` | `--no-ff` 并入平台分支；冲突可续做 |
@@ -211,7 +219,8 @@ created ──► active ──finish（5 门禁）──► ready ──integra
       "worktree": "wt/backend",        // 必填：平台 worktree 路径（相对仓库根）
       "branch": "feature/backend",     // 必填：其集成分支
       "aliases": ["api"],              // 可选：--platform 接受的别名
-      "test_command": "composer test"  // task finish 的默认测试门禁
+      "test_command": "composer test", // task finish 的默认测试门禁
+      "test_timeout": 300              // 可选：测试挂起 N 秒后强杀
     }
   }
 }
@@ -251,6 +260,11 @@ agent CLI 请按上面声明——或者不声明，`task start` 会打印手工
 这个赛道迭代很快，表格只作定位快照、不作评测。agentctl 刻意做家族里
 **headless、重强制** 的那一个——与评审 UI、CI 是组合关系而非替代关系。
 CLI 文案目前为中文，英文输出在路线图中。
+
+## 安全
+
+agentctl 会执行仓库内定义的测试与 runner 命令——请把仓库写权限当作代码执行
+信任级别看待，与 CI 相同。详见 [SECURITY.md](SECURITY.md)。
 
 ## 开发
 
