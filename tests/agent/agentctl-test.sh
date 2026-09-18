@@ -4,7 +4,8 @@
 #
 # 覆盖：doctor 自检、平台探测与声明、任务创建（显式 / 自动 task id + 任务分支 + 独立 worktree）、
 # TASK.md 任务上下文（含不进业务提交）、allowed_paths 范围检查、scope 重叠检测、
-# finish 门禁与 Worker 完成摘要、merge-check（只读）、integrate（含冲突续做）、回收规则、
+# finish 门禁（含测试超时）与 Worker 完成摘要、merge-check（只读）、integrate（含冲突续做）、
+# update-base（基点推进与冲突续做）、adopt（注册表重建）、手工合并放行回收、回收规则、
 # 平台 worktree 告警、AgentRunner（自动启动与降级），以及四个并发场景：
 #   Case 1 两个 agent 同时创建任务　Case 2 两个任务改同一文件互不覆盖
 #   Case 3 merge-check 发现 Git conflict　Case 4 scope 重叠被拦截
@@ -450,6 +451,132 @@ assert_out_contains 'dry-run 打印将创建内容' '[dry-run]'
 assert_absent 'dry-run 不创建 worktree' "$WTROOT/backend/backend-dry-run-task-001"
 assert_absent 'dry-run 不创建任务记录' "$REPO/.agent/tasks/backend-dry-run-task-001.json"
 
-section '21. 结束'
+section '21. task update-base：基点推进、冲突续做与守卫'
+UB=backend-parallel-one-001
+UBW="$WTROOT/backend/$UB"
+mkdir -p "$UBW/src/parallel/p1"
+printf 'export const p1 = "one";\n' >"$UBW/src/parallel/p1/one.ts"
+gw "$UBW" add src/parallel/p1
+gw "$UBW" commit -qm 'feat(p1): one'
+# 平台分支前进（模拟其他任务先集成）
+printf 'export const drift = "platform";\n' >"$REPO/wt/backend/src/shared/drift.ts"
+g -C "$REPO/wt/backend" add src/shared/drift.ts
+g -C "$REPO/wt/backend" commit -qm 'chore(platform): drift'
+BASE_BEFORE="$(json_get "$REPO/.agent/tasks/$UB.json" base_commit)"
+run task update-base "$UB" --dry-run
+assert_rc 'update-base --dry-run 退出码 0' 0
+assert_out_contains 'dry-run 报告平台领先提交数' '领先任务基点 1 个提交'
+[[ "$(json_get "$REPO/.agent/tasks/$UB.json" base_commit)" == "$BASE_BEFORE" ]] && pass 'dry-run 不改注册表' || fail 'dry-run 不改注册表'
+run task update-base "$UB"
+assert_rc 'update-base 合并平台分支' 0
+assert_out_contains '报告基点更新' '基点已更新'
+BASE_AFTER="$(json_get "$REPO/.agent/tasks/$UB.json" base_commit)"
+[[ "$BASE_AFTER" != "$BASE_BEFORE" ]] && pass 'base_commit 已刷新' || fail 'base_commit 已刷新'
+assert_file_contains '平台新提交进入任务 worktree' "$UBW/src/shared/drift.ts" 'platform'
+run task check "$UB"
+assert_rc '新基点下 scope 检查仍通过' 0
+run task update-base "$UB"
+assert_out_contains '平台未前进时 no-op' '无需更新'
+# 脏 worktree 拒绝
+printf 'dirty\n' >"$UBW/src/parallel/p1/tmp.txt"
+run task update-base "$UB"
+assert_rc_nonzero '脏 worktree → 拒绝'
+assert_err_contains '提示先提交' '未提交改动'
+rm -f "$UBW/src/parallel/p1/tmp.txt"
+# ready 任务基点变更后退回 active
+run task set-status "$UB" ready
+printf 'export const p1 = "one-more";\n' >"$UBW/src/parallel/p1/one.ts"
+gw "$UBW" add src/parallel/p1
+gw "$UBW" commit -qm 'feat(p1): more'
+printf 'export const drift2 = "platform2";\n' >"$REPO/wt/backend/src/shared/drift2.ts"
+g -C "$REPO/wt/backend" add src/shared/drift2.ts
+g -C "$REPO/wt/backend" commit -qm 'chore(platform): drift2'
+run task update-base "$UB"
+assert_rc 'ready 任务 update-base' 0
+assert_out_contains 'ready → active 提示' 'ready → active'
+[[ "$(json_get "$REPO/.agent/tasks/$UB.json" status)" == active ]] && pass '状态退回 active' || fail '状态退回 active'
+# merged 任务拒绝
+run task set-status "$UB" merged
+run task update-base "$UB"
+assert_rc_nonzero 'merged 任务拒绝 update-base'
+assert_err_contains '提示已并入' '无需 update-base'
+run task set-status "$UB" active
+# 冲突续做（用 parallel-two，与平台改同一文件）
+UB2=backend-parallel-two-001
+UB2W="$WTROOT/backend/$UB2"
+printf 'export const shared = "from-task";\n' >"$UB2W/src/shared/config.ts"
+gw "$UB2W" add src/shared/config.ts
+gw "$UB2W" commit -qm 'feat(p2): shared config'
+printf 'export const shared = "from-platform";\n' >"$REPO/wt/backend/src/shared/config.ts"
+g -C "$REPO/wt/backend" add src/shared/config.ts
+g -C "$REPO/wt/backend" commit -qm 'chore(platform): shared config'
+run task update-base "$UB2"
+assert_rc_nonzero '冲突 → update-base 退出码非 0'
+assert_out_contains '列出冲突文件' 'src/shared/config.ts'
+assert_out_contains '说明保留进行中的 merge' '保留了进行中的 merge'
+gw "$UB2W" rev-parse -q --verify MERGE_HEAD >/dev/null && pass '任务 worktree 保留进行中的 merge' || fail '任务 worktree 保留进行中的 merge'
+run task update-base "$UB2"
+assert_rc_nonzero '冲突未解决时重跑仍失败'
+printf 'export const shared = "merged-base-update";\n' >"$UB2W/src/shared/config.ts"
+gw "$UB2W" add src/shared/config.ts
+run task update-base "$UB2"
+assert_rc '解决后续做 update-base 成功' 0
+[[ -z "$(gw "$UB2W" rev-parse -q --verify MERGE_HEAD)" ]] && pass '收尾后 merge 已结束' || fail '收尾后 merge 已结束'
+assert_file_contains '合并结果含任务侧改动' "$UB2W/src/shared/config.ts" 'merged-base-update'
+
+section '22. task adopt：注册表丢失后从 TASK.md 重建'
+rm "$REPO/.agent/tasks/$UB2.json"
+run doctor
+assert_out_contains 'doctor 发现未登记分支' 'Orphan task branches: FAIL'
+run -C "$UB2W" task current
+assert_out_contains '注册表丢失后退回 coordinator 模式' 'Mode: coordinator'
+run task adopt
+assert_rc_nonzero '无 TASK.md 的目录拒绝 adopt'
+run -C "$UB2W" task adopt
+assert_rc 'adopt 重建记录' 0
+assert_out_contains 'adopt 输出 Task adopted' 'Task adopted:'
+[[ -f "$REPO/.agent/tasks/$UB2.json" ]] && pass '注册表文件已重建' || fail '注册表文件已重建'
+[[ "$(json_get "$REPO/.agent/tasks/$UB2.json" platform)" == backend ]] && pass 'platform 从 TASK.md 恢复' || fail 'platform 从 TASK.md 恢复'
+[[ "$(json_get "$REPO/.agent/tasks/$UB2.json" status)" == active ]] && pass 'status 从 TASK.md 恢复' || fail 'status 从 TASK.md 恢复'
+[[ "$(json_get "$REPO/.agent/tasks/$UB2.json" allowed_paths.0)" == 'src/parallel/p2/**' ]] && pass 'scope 从 TASK.md 恢复' || fail 'scope 从 TASK.md 恢复'
+[[ "$(json_get "$REPO/.agent/tasks/$UB2.json" schema_version)" == 1 ]] && pass '记录含 schema_version' || fail '记录含 schema_version'
+run -C "$UB2W" task current
+assert_out_contains 'adopt 后恢复 worker 模式' 'Mode: worker'
+run task show "$UB2"
+assert_rc '重建后 task show 可用' 0
+run -C "$UB2W" task adopt
+assert_rc_nonzero '记录已存在 → 拒绝重复 adopt'
+run doctor
+assert_out_contains 'adopt 后 doctor 恢复' 'Orphan task branches: OK'
+
+section '23. 手工合并放行回收、finish 测试超时与 worktree_root 守卫'
+# 在 task-y 内提交，再绕过 agentctl 手工把分支并进平台分支 → remove 无需 --force 放行
+printf 'export const login = "manual";\n' >"$WTROOT/backend/task-y/src/auth/login.ts"
+gw "$WTROOT/backend/task-y" add src/auth/login.ts
+gw "$WTROOT/backend/task-y" commit -qm 'feat(auth): manual work'
+g -C "$REPO/wt/backend" merge --no-ff -m 'manual: task-y' agent/omp/task-y
+run task remove task-y
+assert_rc '分支已并入平台 → 放行回收' 0
+assert_out_contains '放行说明' '放行回收'
+assert_absent 'worktree 已回收' "$WTROOT/backend/task-y"
+assert_absent '任务记录已删除' "$REPO/.agent/tasks/task-y.json"
+# finish 测试超时
+run task finish "$UB" --test-command 'sleep 3' --timeout 1
+assert_rc_nonzero '测试超时 → finish 拒绝'
+assert_err_contains '报错说明超时' '测试超时'
+run task finish "$UB" --test-command true --timeout 60
+assert_rc '未触发的超时不影响 finish' 0
+# worktree_root 配置在仓库内部 → doctor 告警
+mkdir -p "$REPO/.agent/config"
+cat >"$REPO/.agent/config/platforms.json" <<'JSON'
+{
+  "worktree_root": "./inside",
+  "platforms": {}
+}
+JSON
+run doctor
+assert_out_contains 'worktree_root 在仓库内 → doctor 提示' '位于主 checkout 内部'
+
+section '24. 结束'
 printf '\n通过 %d 项，失败 %d 项\n' "$PASS" "$FAILED"
 [[ "$FAILED" == 0 ]] || exit 1

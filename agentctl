@@ -25,7 +25,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync, spawn } = require('node:child_process');
 
-const VERSION = '1.1.0';
+const VERSION = '0.0.1';
 
 // 输出被下游提前关闭（如 `agentctl ... | head`）时静默退出，不抛 EPIPE 堆栈
 process.stdout.on('error', (err) => {
@@ -127,6 +127,8 @@ let WORKTREE_ROOT = '';
 let BRANCH_PREFIX = 'agent';
 let CONFIG = {}; // .agent/config/platforms.json
 let AGENT_CONFIG = {}; // .agent/config/agents.json
+let PLATFORMS_CACHE = null; // 单次调用内缓存平台表（一条命令内不会增删平台 worktree）
+let WORKTREE_ROOT_INSIDE = false; // worktree_root 落在仓库主 checkout 内部时为 true（告警用）
 
 function resolveRoot() {
   const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir']);
@@ -180,6 +182,7 @@ function configInit() {
       : path.join('..', `${path.basename(ROOT)}-agent-worktrees`);
   BRANCH_PREFIX = typeof CONFIG.branch_prefix === 'string' && CONFIG.branch_prefix ? CONFIG.branch_prefix : 'agent';
   WORKTREE_ROOT = normalizePath(wr);
+  WORKTREE_ROOT_INSIDE = isUnder(WORKTREE_ROOT, ROOT);
 }
 
 // ============================ 平台注册表 ============================
@@ -217,6 +220,11 @@ function isUnder(p, dir) {
 }
 
 function buildPlatforms() {
+  if (!PLATFORMS_CACHE) PLATFORMS_CACHE = buildPlatformsUncached();
+  return PLATFORMS_CACHE;
+}
+
+function buildPlatformsUncached() {
   const detected = detectPlatforms();
   const rows = [];
   const used = new Set();
@@ -305,8 +313,12 @@ function resolvePlatform(name) {
 
 function platformBranchLookup(id) {
   if (!id) return '';
-  const row = buildPlatforms().find((r) => r.id === id);
-  return row && row.state === 'ok' ? row.branch : '';
+  const rows = buildPlatforms();
+  const byId = rows.find((r) => r.id === id);
+  if (byId) return byId.state === 'ok' ? byId.branch : '';
+  // 任务可能以别名引用平台（如 --platform backend → 声明 id api）
+  const byAlias = rows.filter((r) => r.state === 'ok' && aliasesFor(r).includes(id));
+  return byAlias.length === 1 ? byAlias[0].branch : '';
 }
 
 // ============================ git 细粒度查询 ============================
@@ -440,6 +452,7 @@ function normalizeTask(task) {
   t.allowed_paths = Array.isArray(t.allowed_paths) ? t.allowed_paths : [];
   t.requirements = Array.isArray(t.requirements) ? t.requirements : [];
   t.status = t.status || 'active';
+  t.schema_version = Number.isInteger(t.schema_version) ? t.schema_version : 1;
   return t;
 }
 
@@ -492,6 +505,24 @@ function effectiveTestCommand(task) {
   const entry = CONFIG.platforms && task ? CONFIG.platforms[task.platform] : null;
   if (entry && typeof entry.test_command === 'string') return entry.test_command;
   return '';
+}
+
+// finish 测试超时秒数：命令行 > 任务记录 > 平台配置；无配置返回 0（不限时）
+function effectiveTestTimeout(task) {
+  const fromTask = task ? Number.parseInt(task.test_timeout, 10) : Number.NaN;
+  if (Number.isFinite(fromTask) && fromTask > 0) return fromTask;
+  const entry = CONFIG.platforms && task ? CONFIG.platforms[task.platform] : null;
+  const fromPlatform = entry ? Number.parseInt(entry.test_timeout, 10) : Number.NaN;
+  return Number.isFinite(fromPlatform) && fromPlatform > 0 ? fromPlatform : 0;
+}
+
+function parseTimeoutArg(raw) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0 || String(n) !== String(raw).trim()) {
+    die(`--timeout 需要正整数秒：${raw}`);
+  }
+  return n;
 }
 
 // ============================ Task ID 自动命名 ============================
@@ -970,7 +1001,7 @@ function warnIfInPlatformWorktree() {
 
 function cmdTaskCreate(argv) {
   const { vals, flags } = parseFlags(argv, {
-    value: ['--platform', '--agent', '--task', '--title', '--objective', '--requirements', '--allowed-paths', '--feature', '--parent', '--test-command'],
+    value: ['--platform', '--agent', '--task', '--title', '--objective', '--requirements', '--allowed-paths', '--feature', '--parent', '--test-command', '--timeout'],
     bool: ['--start', '--allow-overlap', '--dry-run'],
   });
   const platformName = vals['--platform'];
@@ -996,6 +1027,9 @@ function cmdTaskCreate(argv) {
   }
   warnIfInPlatformWorktree();
   warnIfInTaskWorktree();
+  if (WORKTREE_ROOT_INSIDE) {
+    warn(`worktree_root（${WORKTREE_ROOT}）位于仓库主 checkout 内部：任务 worktree 会污染主 checkout 的 git status，建议在 .agent/config/platforms.json 配置为仓库外的同级目录。`);
+  }
 
   const conflicts = findScopeConflicts(row.id, allowed, vals['--task'] || '');
   const overlaps = conflicts.filter((c) => c.overlap);
@@ -1028,6 +1062,7 @@ function cmdTaskCreate(argv) {
     const task = {
       id: taskId,
       uuid: crypto.randomUUID(),
+      schema_version: 1,
       title: title || taskId,
       objective,
       requirements,
@@ -1043,6 +1078,7 @@ function cmdTaskCreate(argv) {
       feature: vals['--feature'] || null,
       parent_task: vals['--parent'] || null,
       test_command: vals['--test-command'] || null,
+      test_timeout: parseTimeoutArg(vals['--timeout']),
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       finished_at: null,
@@ -1380,7 +1416,7 @@ function cmdTaskDiff(argv) {
 // ============================ task finish ============================
 
 function cmdTaskFinish(argv) {
-  const { vals, flags, positional } = parseFlags(argv, { value: ['--test-command'], bool: ['--no-test'] });
+  const { vals, flags, positional } = parseFlags(argv, { value: ['--test-command', '--timeout'], bool: ['--no-test'] });
   const id = positional[0];
   if (!id) usageError('task finish 需要 task id');
   const task = readTask(id);
@@ -1433,12 +1469,22 @@ function cmdTaskFinish(argv) {
     if (!testCommand) {
       testState = 'skipped（未配置测试命令）';
     } else {
-      note(`  [5/5] 测试：${testCommand}`);
+      const timeoutSec = vals['--timeout'] !== undefined ? parseTimeoutArg(vals['--timeout']) : effectiveTestTimeout(task);
+      note(`  [5/5] 测试：${testCommand}${timeoutSec ? `（超时 ${timeoutSec}s）` : ''}`);
       note('');
-      const res = spawnSync('bash', ['-c', testCommand], { cwd: task.worktree, stdio: 'inherit', env: process.env });
+      const spawnOpts = { cwd: task.worktree, stdio: 'inherit', env: process.env };
+      if (timeoutSec) {
+        spawnOpts.timeout = timeoutSec * 1000;
+        spawnOpts.killSignal = 'SIGTERM';
+      }
+      const res = spawnSync('bash', ['-c', testCommand], spawnOpts);
+      const timedOut = Boolean(timeoutSec) && Boolean(res.error) && res.error.code === 'ETIMEDOUT';
       const rc = res.status === null ? 1 : res.status;
       note('');
-      if (rc === 0) {
+      if (timedOut) {
+        testState = `FAIL（${testCommand}，超时 ${timeoutSec}s 被终止）`;
+        failures.push(`测试超时（${timeoutSec}s）：${testCommand}`);
+      } else if (rc === 0) {
         testState = `OK（${testCommand}）`;
       } else {
         testState = `FAIL（${testCommand}，退出码 ${rc}）`;
@@ -1508,6 +1554,250 @@ function cmdTaskSetStatus(argv) {
   const task = readTask(id);
   const updated = updateTask(id, { status, status_note: vals['--note'] || null });
   note(`任务 ${task.id} 状态：${task.status} → ${updated.status}${vals['--note'] ? `（${vals['--note']}）` : ''}`);
+}
+
+// ============================ task update-base ============================
+
+// 平台分支随其他任务 integrate 不断前进后，把新提交合并进任务分支并刷新
+// base_commit，让 scope 检查与 finish 门禁始终对着正确的基点。
+// 冲突语义与 integrate 一致：保留进行中的 merge，解决后重跑收尾。
+function cmdTaskUpdateBase(argv) {
+  const { flags, positional } = parseFlags(argv, { bool: ['--dry-run'] });
+  const id = positional[0];
+  if (!id) usageError('task update-base 需要 task id');
+  const task = readTask(id);
+  if (task.status === 'merged') {
+    die(`任务已并入 ${task.merged_into || '平台分支'}：无需 update-base（回收用 ${SELF} task remove ${id}）`);
+  }
+  if (task.status === 'conflict' || task.status === 'integrating') {
+    die(`任务处于集成阶段（${task.status}）：先在平台 worktree 收尾或放弃该 merge，再做 update-base`);
+  }
+  if (!isDir(task.worktree)) die(`任务 worktree 不存在：${task.worktree}`);
+  if (!branchExists(task.task_branch)) die(`任务分支不存在：${task.task_branch}`);
+  const row = resolvePlatform(task.platform);
+  const platformTip = revParse(row.branch);
+  if (!platformTip) die(`平台分支不存在：${row.branch}`);
+
+  const headRef = currentBranch(task.worktree);
+  if (headRef !== task.task_branch) {
+    die(`任务 worktree 当前检出分支是 ${headRef}，期望 ${task.task_branch}`);
+  }
+  const dirty = git(['-C', task.worktree, 'status', '--porcelain']).stdout.trim() !== '';
+  if (dirty && !mergeInProgress(task.worktree)) {
+    die(`任务 worktree 存在未提交改动：先提交后再 update-base（agentctl 不会丢弃任何内容）\n${task.worktree}`);
+  }
+
+  note(`Task update-base: ${row.branch} → ${task.task_branch}`);
+  note('');
+
+  if (mergeInProgress(task.worktree)) {
+    // 续做上次 update-base 的冲突合并
+    const mergeHead = git(['-C', task.worktree, 'rev-parse', 'MERGE_HEAD']).stdout.trim();
+    if (mergeHead !== platformTip) {
+      die(`存在其他进行中的 merge（MERGE_HEAD=${mergeHead.slice(0, 8)}，当前平台 HEAD=${platformTip.slice(0, 8)}）：请先收尾，或 cd ${task.worktree} && git merge --abort 后重试`);
+    }
+    const unmerged = lines(git(['-C', task.worktree, 'diff', '--name-only', '--diff-filter=U']).stdout);
+    if (unmerged.length > 0) {
+      note('上次 update-base 的 merge 仍在进行，以下文件冲突尚未解决：');
+      note(unmerged.map((f) => `  ${f}`).join('\n'));
+      note('');
+      note(`解决后：cd ${task.worktree} && git add <files>，再执行 ${SELF} task update-base ${id} 收尾。`);
+      note(`放弃本次基点更新：cd ${task.worktree} && git merge --abort`);
+      process.exit(1);
+    }
+    note('冲突已解决，收尾基点更新合并…');
+    const commit = git(['-C', task.worktree, 'commit', '--no-edit']);
+    if (commit.status !== 0) die(`收尾合并提交失败（cd ${task.worktree} && git status 查看）`);
+    finishUpdateBase(task, platformTip, flags.has('--dry-run'));
+    return;
+  }
+
+  const behind = task.base_commit ? revListCount(`${task.base_commit}..refs/heads/${row.branch}`) : 0;
+  const ahead = task.base_commit ? revListCount(`${task.base_commit}..refs/heads/${task.task_branch}`) : 0;
+  if (flags.has('--dry-run')) {
+    note(`[dry-run] 平台分支领先任务基点 ${behind} 个提交；任务分支领先 ${ahead} 个提交。`);
+    note(`[dry-run] 将执行：cd ${task.worktree} && git merge --no-edit ${row.branch}`);
+    return;
+  }
+  if (behind === 0) {
+    note(`已基于 ${row.branch} 最新提交（${platformTip.slice(0, 8)}）：无需更新。`);
+    return;
+  }
+  note(`平台分支领先任务基点 ${behind} 个提交（任务分支领先 ${ahead} 个），合并中…`);
+  const res = git(['-C', task.worktree, 'merge', '--no-edit', row.branch]);
+  if (res.status !== 0) {
+    if (mergeInProgress(task.worktree)) {
+      const conflicted = lines(git(['-C', task.worktree, 'diff', '--name-only', '--diff-filter=U']).stdout);
+      note('');
+      note('update-base CONFLICT：任务 worktree 中保留了进行中的 merge（未回退、未丢弃任何内容）。');
+      note('');
+      note('Conflicted files:');
+      note(conflicted.map((f) => `  ${f}`).join('\n'));
+      note('');
+      note(`解决后：cd ${task.worktree} && git add <files>，再执行 ${SELF} task update-base ${id} 收尾。`);
+      note(`放弃本次基点更新：cd ${task.worktree} && git merge --abort`);
+      process.exit(1);
+    }
+    die(`merge 失败（cd ${task.worktree} && git status 查看）\n${(res.stderr || res.stdout).trim()}`);
+  }
+  finishUpdateBase(task, platformTip, false);
+}
+
+function finishUpdateBase(task, newBase, dryRun) {
+  if (dryRun) return;
+  // 基点移动后以新基点复核 scope：只提示，不拦截（finish 才是门禁）
+  const changed = collectChanges(task.worktree, newBase);
+  const unexpected = scopeUnexpected(task.allowed_paths, changed);
+
+  const demoted = task.status === 'ready';
+  const updated = updateTask(task.id, demoted
+    ? { base_commit: newBase, status: 'active', finished_at: null, finished_commit: null }
+    : { base_commit: newBase });
+
+  if (JSON_OUT) {
+    note(JSON.stringify({
+      id: updated.id,
+      platform: updated.platform,
+      task_branch: updated.task_branch,
+      base_branch: updated.base_branch,
+      base_commit: newBase,
+      status: updated.status,
+      status_demoted: demoted,
+      changed_files: changed.length,
+      unexpected,
+    }, null, 2));
+    return;
+  }
+
+  note('');
+  note(`基点已更新：${updated.base_branch} @ ${newBase.slice(0, 8)}（${updated.task_branch}）。`);
+  note(`相对新基点的改动文件：${changed.length} 个${unexpected.length === 0 ? '，均在 allowed_paths 内' : ''}。`);
+  if (unexpected.length > 0) {
+    warn('以下文件越出 allowed_paths（update-base 不拦截，但 task finish 会拒绝）：');
+    process.stderr.write(`${unexpected.map((u) => `  ${u}`).join('\n')}\n`);
+  }
+  if (demoted) {
+    note('状态 ready → active：基点已变更，需重新 finish 后再 integrate。');
+  }
+  note('');
+  printNext(updated);
+}
+
+// ============================ task adopt ============================
+
+// 注册表（.agent/tasks/*.json）是运行时状态，可能被误删；adopt 从任务 worktree
+// 内的 .agent/TASK.md + 任务分支重建记录，把孤儿任务重新纳入管理。
+function cmdTaskAdopt(argv) {
+  parseFlags(argv);
+  const cwd = normalizePath(process.cwd());
+  const contextFile = taskContextPath(cwd);
+  if (!isFile(contextFile)) {
+    die(`当前目录没有任务上下文：${contextFile}\ntask adopt 需在孤儿任务的 worktree 内运行（从 .agent/TASK.md 与任务分支重建注册表记录）`);
+  }
+  const text = fs.readFileSync(contextFile, 'utf8');
+  const field = (name) => {
+    const m = text.match(new RegExp(`^${name}: (.*)$`, 'm'));
+    return m ? m[1].trim() : '';
+  };
+  const id = field('Task ID');
+  const platform = field('Platform');
+  const agent = field('Agent');
+  const baseBranch = field('Base Branch');
+  const taskBranch = field('Task Branch');
+  const statusLine = field('Status');
+  const created = field('Created');
+  validateSlug('task id', id);
+  validateSlug('agent 名', agent);
+  if (!platform || !baseBranch || !taskBranch) {
+    die(`TASK.md 缺少关键字段（Platform / Base Branch / Task Branch）：${contextFile}`);
+  }
+
+  const file = taskPath(id);
+  if (isFile(file)) die(`任务记录已存在：${file}（无需 adopt）`);
+  if (!branchExists(taskBranch)) die(`任务分支不存在：${taskBranch}——没有分支就没有可恢复的提交，拒绝凭空 adopt`);
+  if (!branchExists(baseBranch)) {
+    warn(`基点分支 ${baseBranch} 不存在（平台可能已改名）：记录照建，integrate 前需先对齐平台 registry。`);
+  }
+
+  // ## <标题> 与下一个 ## 之间的内容
+  const sectionBody = (title) => {
+    const m = text.match(new RegExp(`## ${title}\\n\\n([\\s\\S]*?)\\n## `));
+    return m ? m[1] : '';
+  };
+  const objective = sectionBody('Objective').split('\n')[0].trim() || id;
+  const requirements = sectionBody('Requirements')
+    .split('\n')
+    .filter((l) => l.startsWith('- '))
+    .map((l) => l.slice(2).trim())
+    .filter(Boolean);
+  const scopeBody = sectionBody('Scope');
+  const allowed = scopeBody.startsWith('Allowed paths: 未限定')
+    ? []
+    : scopeBody.split('\n').filter((l) => l.startsWith('- ')).map((l) => l.slice(2).trim()).filter(Boolean);
+  const status = STATUSES.includes(statusLine) ? statusLine : 'active';
+
+  const mb = git(['-C', ROOT, 'merge-base', taskBranch, baseBranch]);
+  if (mb.status !== 0) {
+    die(`无法求 merge-base：${taskBranch} 与 ${baseBranch} 无共同祖先，拒绝 adopt`);
+  }
+  const baseCommit = mb.stdout.trim();
+
+  if (!buildPlatforms().some((r) => r.id === platform)) {
+    warn(`平台 ${platform} 不在当前 registry 中：记录照建，集成前先在 .agent/config/platforms.json 对齐。`);
+  }
+
+  const task = normalizeTask({
+    id,
+    uuid: crypto.randomUUID(),
+    schema_version: 1,
+    title: objective,
+    objective,
+    requirements,
+    platform,
+    agent,
+    base_branch: baseBranch,
+    base_commit: baseCommit,
+    task_branch: taskBranch,
+    worktree: cwd,
+    worktree_rel: relToRoot(cwd),
+    status,
+    allowed_paths: allowed,
+    feature: null,
+    parent_task: null,
+    test_command: null,
+    test_timeout: null,
+    created_at: created || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    finished_at: null,
+    finished_commit: null,
+    merged_at: null,
+    merged_into: null,
+    merged_commit: null,
+  });
+
+  withRegistryLock(() => {
+    if (isFile(file)) die(`任务记录已存在：${file}（无需 adopt）`);
+    writeTask(task);
+  });
+  ensureTaskContextExcluded();
+
+  if (JSON_OUT) {
+    note(JSON.stringify({ adopted: task.id, platform, agent, task_branch: taskBranch, base_commit: baseCommit, status: task.status, allowed_paths: allowed }, null, 2));
+    return;
+  }
+  note(`Task adopted: ${task.id}`);
+  note(`  Platform:   ${platform}`);
+  note(`  Agent:      ${agent}`);
+  note(`  Branch:     ${taskBranch}`);
+  note(`  Worktree:   ${cwd}`);
+  note(`  Base:       ${baseBranch} @ ${baseCommit.slice(0, 8)}`);
+  note(`  Status:     ${status}`);
+  note('Allowed paths:');
+  note(allowedBlock(allowed));
+  note('');
+  note(`已重建注册表记录：${file}`);
+  note('');
+  printNext(task);
 }
 
 // ============================ task start ============================
@@ -1730,10 +2020,16 @@ function cmdTaskRemove(argv) {
   const force = flags.has('--force');
   const task = readTask(id);
 
-  if (task.status !== 'merged' && !force) {
+  // 注册表状态可能落后于现实（有人在 agentctl 之外手工合并）：分支确已并入平台分支时放行回收
+  const pb = platformBranchLookup(task.platform);
+  const mergedLive = Boolean(pb) && branchExists(task.task_branch) && branchExists(pb) && isAncestor(task.task_branch, pb);
+  if (task.status !== 'merged' && mergedLive) {
+    note(`任务状态 ${task.status}，但分支已并入 ${pb}（注册表外的手工合并）：放行回收。`);
+  }
+  if (task.status !== 'merged' && !mergedLive && !force) {
     die(`任务未并入平台分支（status: ${task.status}），拒绝删除。如确认丢弃该任务与其分支，使用：agentctl task remove ${task.id} --force`);
   }
-  if (task.status !== 'merged') {
+  if (task.status !== 'merged' && !mergedLive) {
     warn(`任务状态为 ${task.status}（未并入平台分支）：--force 将删除其 worktree 与分支，未合并的提交只会留在 reflog 中。`);
   }
 
@@ -1756,12 +2052,10 @@ function cmdTaskRemove(argv) {
   }
 
   if (branchExists(task.task_branch)) {
-    const pb = platformBranchLookup(task.platform);
-    const merged = Boolean(pb) && branchExists(pb) && isAncestor(task.task_branch, pb);
-    if (!merged && !force) {
+    if (!mergedLive && !force) {
       die(`分支 ${task.task_branch} 未确认并入 ${pb || '平台分支'}，拒绝删除（如确认丢弃，用 --force）`);
     }
-    if (!merged) warn(`分支 ${task.task_branch} 未确认并入 ${pb || '平台分支'}，按 --force 强删`);
+    if (!mergedLive) warn(`分支 ${task.task_branch} 未确认并入 ${pb || '平台分支'}，按 --force 强删`);
     const del = git(['-C', ROOT, 'branch', '-D', task.task_branch]);
     if (del.status !== 0) die(`分支删除失败：${task.task_branch}\n${(del.stderr || '').trim()}`);
     note(`已删除分支：${task.task_branch}`);
@@ -1780,7 +2074,8 @@ function cmdDoctor(argv) {
 
   const gitVer = git(['--version']).stdout.trim();
   add('Git', git(['--version']).status === 0, gitVer);
-  add('Node', true, process.version);
+  const nodeMajor = Number.parseInt(process.version.slice(1), 10);
+  add('Node', nodeMajor >= 20, `${process.version}${nodeMajor >= 20 ? '' : '（agentctl 需要 node ≥ 20）'}`);
   add('Repository', true, `${ROOT}（${currentBranch(ROOT)}）`);
 
   const wtSupport = git(['worktree', 'list', '--porcelain']).status === 0;
@@ -1795,6 +2090,24 @@ function cmdDoctor(argv) {
   for (const t of tasks) byStatus[t.status] = (byStatus[t.status] || 0) + 1;
   add('Task Registry', isDir(TASKS_DIR) || tasks.length === 0,
     `${tasks.length} 条任务${tasks.length ? `（${Object.entries(byStatus).map(([k, v]) => `${k}:${v}`).join(' ')}）` : ''}`);
+
+  add('Worktree root', !WORKTREE_ROOT_INSIDE,
+    WORKTREE_ROOT_INSIDE
+      ? `${WORKTREE_ROOT} 位于主 checkout 内部，任务 worktree 会污染主 checkout 的 git status；建议在 .agent/config/platforms.json 把 worktree_root 配置为仓库外的同级目录`
+      : WORKTREE_ROOT);
+
+  // agent/<agent>/<task-id> 分支存在但没有注册表记录 → 注册表被误删的孤儿
+  const orphanBranches = git(['-C', ROOT, 'branch', '--format=%(refname:short)'])
+    .stdout.split('\n')
+    .map((s) => s.trim())
+    .filter((b) => b.startsWith(`${BRANCH_PREFIX}/`))
+    .map((b) => ({ branch: b, id: b.slice(BRANCH_PREFIX.length + 1).split('/').pop() }))
+    .filter((e) => e.id && !isFile(taskPath(e.id)))
+    .map((e) => e.branch);
+  add('Orphan task branches', orphanBranches.length === 0,
+    orphanBranches.length
+      ? `${orphanBranches.length} 条未登记：${orphanBranches.join('　')}（在对应 worktree 内运行 agentctl task adopt 可恢复）`
+      : '无未登记的 agent 分支');
 
   const agentRows = [...new Set([...Object.keys(BUILTIN_RUNNERS), ...Object.keys(AGENT_CONFIG)])].map((n) => runnerFor(n));
   const detectedAgents = agentRows.filter((r) => r.detected).map((r) => r.name);
@@ -1874,6 +2187,7 @@ function cmdHelp() {
         --feature <名称>           跨平台 feature 分组标记
         --parent <名称>            feature 内父级任务标记
         --test-command '<cmd>'     finish 时执行的测试命令（默认取平台配置）
+        --timeout <秒>             finish 测试超时秒数（默认取平台 test_timeout）
         --allow-overlap            与已有任务 scope 重叠时仍创建（显式确认）
         --dry-run                  只打印将创建的内容
         --start                    创建后立即启动 Worker（不可用时降级为打印命令）
@@ -1882,11 +2196,14 @@ function cmdHelp() {
   agentctl task start <id> [--dry-run]      按 AgentRunner 启动 Worker
   agentctl task check <id>                  校验实际改动是否越出 allowed_paths（越界退出码 1）
   agentctl task diff <id> [--stat|--name-only] [--working]
-  agentctl task finish <id> [--no-test] [--test-command '<cmd>']
+  agentctl task finish <id> [--no-test] [--test-command '<cmd>'] [--timeout <秒>]
       门禁：worktree 与分支正确、无未提交改动、改动未越界、至少一个 commit、测试通过。
       通过后状态置 ready 并输出 Worker 完成摘要；不删除、不丢弃任何改动。
   agentctl task set-status <id> <status>    标记 blocked / failed / cancelled 等
       状态：${STATUSES.join(' / ')}
+  agentctl task update-base <id> [--dry-run]  把平台分支新提交合并进任务分支并刷新基点
+      冲突时保留进行中的 merge，解决后重跑收尾；ready 任务基点变更后状态退回 active。
+  agentctl task adopt                       在孤儿任务 worktree 内从 .agent/TASK.md 重建注册表记录
   agentctl task merge-check <id>            只读判断能否并入平台分支（不改动平台 worktree）
   agentctl task integrate <id> [--force]    在平台 worktree 内 --no-ff 合并任务分支
   agentctl task remove <id> [--force]       仅 merged + 干净时回收 worktree / 分支 / 记录
@@ -1966,6 +2283,8 @@ function main() {
       case 'diff': return cmdTaskDiff(args);
       case 'finish': return cmdTaskFinish(args);
       case 'set-status': return cmdTaskSetStatus(args);
+      case 'update-base': return cmdTaskUpdateBase(args);
+      case 'adopt': return cmdTaskAdopt(args);
       case 'start': return cmdTaskStart(args);
       case 'merge-check': return cmdTaskMergeCheck(args);
       case 'integrate': return cmdTaskIntegrate(args);
