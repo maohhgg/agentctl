@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.3] - 2026-09-19
+
+### Added
+
+- **Agent self-identification**: `--agent` is now optional at `task create`.
+  When omitted, the name resolves from the `AGENTCTL_AGENT` environment
+  variable, then from the process ancestry — walking the PPID chain via `ps`
+  and matching known agent CLI basenames including `-`-suffixed variants
+  (`zcode-cli` → `zcode`). Known names = built-in runners ∪ keys of
+  `.agents/config/agents.json` ∪ a default list (`omp`, `opencode`, `codex`,
+  `claude`, `zcode`, `commandcode`, `qoder`, `gemini`, `aider`, `droid`,
+  `goose`, `crush`, `copilot`, `windsurf`). If neither source resolves,
+  creation is refused with guidance to pass `--agent` explicitly; the explicit
+  flag always wins, and the create output states which source filled the name.
+- `agentctl whoami`: shows what would be self-identified in the current
+  session (env / process chain / effective value; `--json` supported). Run it
+  inside each CLI to verify wiring.
+
 ## [0.0.2] - 2026-09-19
 
 ### Added
@@ -87,5 +105,6 @@ Initial public development release.
   `task diff` (base / working / staged).
 - End-to-end test suite running entirely in throwaway temp repos.
 
+[0.0.3]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.3
 [0.0.2]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.2
 [0.0.1]: https://github.com/maohhgg/agentctl/releases/tag/v0.0.1

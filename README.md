@@ -80,6 +80,10 @@ integration time. agentctl deliberately implements **no file locks**.
 - **Runner that never guesses flags** — built-in launch templates exist only for
   CLIs verified on a real install (`omp`, `opencode`); anything else is declared
   per-project in `agents.json`, or degrades to printing the manual command.
+- **Agent self-identification** — `--agent` is optional at `task create`: when
+  omitted, the name resolves from the `AGENTCTL_AGENT` env var or the process
+  ancestry (`zcode`, `omp`, `commandcode`, `qoder`, …; `agentctl whoami` shows
+  what would be detected). Coordinators can no longer mislabel who is running.
 - **Human-readable task ids** — `Implement Google OAuth` on platform `backend`
   becomes `backend-google-oauth-001` (stop-words dropped, collisions numbered).
 
@@ -176,6 +180,7 @@ agentctl [-C <dir>] [--json] <command> [args]
 | Command | Purpose |
 |---|---|
 | `init` | One-time setup: generate `platforms.json` from detected worktrees, add `.gitignore` entries (idempotent, never overwrites) |
+| `whoami` | Show which agent name would be self-identified in this session |
 | `doctor` | Self-check: git, repo, worktrees, registry, agent CLIs, mode |
 | `agent list` | Agent runners and whether they're detected on PATH |
 | `platform list` | Platform registry (auto-detected + declared), state and aliases |
@@ -240,7 +245,8 @@ verified built-in one; `{worktree}` and `{prompt}` are substituted):
 
 We ship built-in templates only for flags we verified against a real installed
 version (`omp` 18.2.5, `opencode`). For your own agent CLIs, declare them as
-above — or don't, and `task start` will print the manual command.
+above — or don't, and `task start` will print the manual command. Keys declared
+here also join the known-name set for `--agent` self-identification.
 
 Task records live in `.agents/tasks/<id>.json` and runtime files in
 `.agents/state/` — both are runtime state. `agentctl init` adds the

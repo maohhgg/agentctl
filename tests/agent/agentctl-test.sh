@@ -6,7 +6,8 @@
 # TASK.md 任务上下文（含不进业务提交）、allowed_paths 范围检查、scope 重叠检测、
 # finish 门禁（含测试超时）与 Worker 完成摘要、merge-check（只读）、integrate（含冲突续做）、
 # update-base（基点推进与冲突续做）、adopt（注册表重建）、手工合并放行回收、回收规则、
-# init（配置生成 / gitignore / 幂等）、平台 worktree 告警、AgentRunner（自动启动与降级），以及四个并发场景：
+# init（配置生成 / gitignore / 幂等）、agent 自识别（whoami / env / flag 优先级）、
+# 平台 worktree 告警、AgentRunner（自动启动与降级），以及四个并发场景：
 #   Case 1 两个 agent 同时创建任务　Case 2 两个任务改同一文件互不覆盖
 #   Case 3 merge-check 发现 Git conflict　Case 4 scope 重叠被拦截
 #
@@ -608,6 +609,32 @@ cmp "$WORK/platforms.before.json" "$REPO/.agents/config/platforms.json" && pass 
 run doctor
 assert_out_contains 'doctor 确认 gitignore 排除' 'Runtime state gitignore: OK'
 
-section '25. 结束'
+section '26. agent 自识别：--agent 缺省时的解析与拒绝'
+# 拒绝用例仅在没有已知 agent 祖先时可测（如 CI；在 agent CLI 宿主内跳过）
+PROC_HIT=$("$AGENTCTL" --json whoami | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{console.log(JSON.parse(s).process||"")})')
+if [[ -z "$PROC_HIT" ]]; then
+  run task create --platform backend --task task-who --title 'Who Task'
+  assert_rc_nonzero '无法自识别 → 拒绝创建'
+  assert_err_contains '提示显式传 --agent' '--agent'
+else
+  pass "无法自识别 → 拒绝创建（跳过：宿主进程链含已知 agent ${PROC_HIT}）"
+fi
+# env 显式指定生效，且创建输出标注来源
+AGENTCTL_AGENT=qoder "$AGENTCTL" task create --platform backend --task task-env --title 'Env Task' >"$WORK/env.out" 2>&1
+[[ "$(json_get "$REPO/.agents/tasks/task-env.json" agent)" == qoder ]] && pass 'AGENTCTL_AGENT 环境变量生效' || fail 'AGENTCTL_AGENT 环境变量生效'
+grep -q 'AGENTCTL_AGENT 环境变量' "$WORK/env.out" && pass '创建输出标注来源' || fail '创建输出标注来源'
+run task remove task-env --force
+assert_rc '清理 task-env' 0
+# flag 优先于 env
+AGENTCTL_AGENT=qoder "$AGENTCTL" task create --platform backend --task task-flag --agent claude --title 'Flag Task' >/dev/null 2>&1
+[[ "$(json_get "$REPO/.agents/tasks/task-flag.json" agent)" == claude ]] && pass 'flag 优先于 env' || fail 'flag 优先于 env'
+run task remove task-flag --force
+assert_rc '清理 task-flag' 0
+run whoami
+assert_rc 'whoami 退出码 0' 0
+run --json whoami
+assert_rc 'whoami --json 退出码 0' 0
+
+section '27. 结束'
 printf '\n通过 %d 项，失败 %d 项\n' "$PASS" "$FAILED"
 [[ "$FAILED" == 0 ]] || exit 1

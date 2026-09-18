@@ -70,6 +70,10 @@ checkout 时会互相覆盖文件、互相污染 git 状态——分支隔离解
   各自的测试命令）；未声明的 worktree 自动探测。
 - **Runner 不猜参数**：只为真实安装实测过的 CLI（`omp`、`opencode`）内置
   启动模板；其余在项目 `agents.json` 里声明，或降级为打印手工启动命令。
+- **Agent 自识别**：`task create` 的 `--agent` 可省略——缺省时从
+  `AGENTCTL_AGENT` 环境变量或进程祖先链解析执行者（`zcode`、`omp`、
+  `commandcode`、`qoder` 等；`agentctl whoami` 查看识别结果）。Coordinator
+  不再可能填错执行者。
 - **可读 task id**：平台 `backend` + 标题 `Implement Google OAuth` →
   `backend-google-oauth-001`（去动词停用词，撞名自动递增）。
 
@@ -162,6 +166,7 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 | 命令 | 说明 |
 |---|---|
 | `init` | 一次性初始化：按探测平台生成 `platforms.json`、补 `.gitignore` 排除（幂等，绝不覆盖） |
+| `whoami` | 查看当前会话的 agent 自识别结果 |
 | `doctor` | 自检：git / 仓库 / worktree / 注册表 / agent CLI / 当前模式 |
 | `agent list` | Agent runner 与本机检测结果 |
 | `platform list` | 平台注册表（探测 + 声明）、状态与别名 |
@@ -225,6 +230,7 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 
 内置模板只收录本机实测过参数的 CLI（`omp` 18.2.5、`opencode`）。其他
 agent CLI 请按上面声明——或者不声明，`task start` 会打印手工启动命令。
+此处声明的键名同时加入 `--agent` 自识别的已知名字集。
 
 任务记录在 `.agents/tasks/<id>.json`、运行时产物在 `.agents/state/`——都是
 运行时状态。`agentctl init` 会自动补 `.gitignore` 排除项，`doctor` 负责检查。

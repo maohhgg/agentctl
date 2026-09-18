@@ -1,6 +1,6 @@
 {
   "name": "agent-task-worktree",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "agentctl — one git worktree per AI coding agent task: scope-enforced, gate-checked, zero dependencies, single file.",
   "license": "MIT",
   "author": "maohhgg",

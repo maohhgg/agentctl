@@ -25,7 +25,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync, spawn } = require('node:child_process');
 
-const VERSION = '0.0.2';
+const VERSION = '0.0.3';
 
 // 输出被下游提前关闭（如 `agentctl ... | head`）时静默退出，不抛 EPIPE 堆栈
 process.stdout.on('error', (err) => {
@@ -765,6 +765,69 @@ function writeTaskContext(task) {
   return file;
 }
 
+// ============================ agent 自识别 ============================
+// Coordinator 建任务时常填错或照抄文档示例里的 CLI 名。--agent 缺省时按
+// 「AGENTCTL_AGENT 环境变量 → 进程祖先链自识别」解析；都失败才拒绝并提示显式传参。
+// 识别规则：祖先进程命令行参数的 basename（去 .js/.cjs/.mjs 扩展名）命中
+// 「内置 runner ∪ agents.json 声明 ∪ 常见 agent 名」即返回。
+const KNOWN_AGENT_NAMES = new Set([
+  'omp', 'opencode', 'codex', 'claude', 'zcode', 'commandcode', 'qoder',
+  'gemini', 'aider', 'droid', 'goose', 'crush', 'copilot', 'windsurf',
+]);
+
+function knownAgentNames() {
+  return new Set([...KNOWN_AGENT_NAMES, ...Object.keys(AGENT_CONFIG || {})]);
+}
+
+function detectAgentFromProcessChain() {
+  const known = knownAgentNames();
+  let pid = process.pid;
+  for (let depth = 0; depth < 15; depth++) {
+    if (pid <= 1) return '';
+    const r = spawnSync('ps', ['-o', 'ppid=,args=', '-p', String(pid)], { encoding: 'utf8' });
+    if (r.status !== 0 || !r.stdout.trim()) return '';
+    const m = r.stdout.replace(/\n+$/, '').match(/^\s*(\d+)\s+(.*)$/);
+    if (!m) return '';
+    pid = Number.parseInt(m[1], 10);
+    for (const token of m[2].split(/\s+/)) {
+      const base = path.basename(token).replace(/\.(js|cjs|mjs)$/i, '');
+      // 变体归一：zcode-cli / zcode-server 之类派生进程名都归属 zcode
+      for (const name of known) {
+        if (base === name || base.startsWith(`${name}-`)) return name;
+      }
+    }
+  }
+  return '';
+}
+
+// --agent 缺省时的解析：flag > AGENTCTL_AGENT 环境变量 > 进程链。返回 { agent, source } 或 null。
+function resolveAgentName(explicit) {
+  if (explicit) return { agent: explicit, source: 'flag' };
+  const fromEnv = (process.env.AGENTCTL_AGENT || '').trim();
+  if (fromEnv) return { agent: fromEnv, source: 'env' };
+  const fromProcess = detectAgentFromProcessChain();
+  if (fromProcess) return { agent: fromProcess, source: 'process' };
+  return null;
+}
+
+const AGENT_SOURCE_LABELS = { flag: '显式 --agent', env: 'AGENTCTL_AGENT 环境变量', process: '进程链自识别' };
+
+function cmdWhoami(argv) {
+  parseFlags(argv);
+  const resolved = resolveAgentName('');
+  if (JSON_OUT) {
+    note(JSON.stringify({ env: resolved?.source === 'env' ? resolved.agent : null, process: resolved?.source === 'process' ? resolved.agent : null, effective: resolved?.agent ?? null }, null, 2));
+    return;
+  }
+  const envName = (process.env.AGENTCTL_AGENT || '').trim();
+  const procName = resolved?.source === 'process' ? resolved.agent : '';
+  note(`AGENTCTL_AGENT 环境变量：${envName || '（未设置）'}`);
+  note(`进程链自识别：${procName || '（未识别出已知 agent CLI）'}`);
+  note(`生效值（task create --agent 缺省时）：${resolved ? `${resolved.agent}（${AGENT_SOURCE_LABELS[resolved.source]}）` : '（无 → 建任务需显式传 --agent）'}`);
+  note('');
+  note('已知名字集：内置 runner ∪ .agents/config/agents.json 声明 ∪ 常见 agent CLI 名；不确定时显式传 --agent。');
+}
+
 // ============================ AgentRunner ============================
 // 只做「发现 + 构造启动命令 + 启动」，不重新实现任何 agent 自身能力。
 // 内置模板来自本机 CLI 的 --help 实测；未实测的 CLI 必须由 .agents/config/agents.json 声明，
@@ -1077,10 +1140,14 @@ function cmdTaskCreate(argv) {
     bool: ['--start', '--allow-overlap', '--dry-run'],
   });
   const platformName = vals['--platform'];
-  const agent = vals['--agent'];
   const title = vals['--title'];
   if (!platformName) usageError('缺少 --platform');
-  if (!agent) usageError('缺少 --agent');
+  const resolved = resolveAgentName(vals['--agent']);
+  if (!resolved) {
+    usageError('缺少 --agent（未设置 AGENTCTL_AGENT，进程链中也未识别出已知 agent CLI；可运行 agentctl whoami 查看识别结果，或显式传 --agent <名字>）');
+  }
+  const agent = resolved.agent;
+  const agentSource = resolved.source;
   if (!title && !vals['--task']) usageError('缺少 --title（或显式 --task）');
   validateSlug('agent 名', agent);
   if (vals['--task']) validateSlug('task id', vals['--task']);
@@ -1199,7 +1266,7 @@ function cmdTaskCreate(argv) {
   note(`  ${row.id}  (${relToRoot(row.worktree)} @ ${row.branch})`);
   note('');
   note('Agent:');
-  note(`  ${agent}`);
+  note(`  ${agent}　［${AGENT_SOURCE_LABELS[agentSource]}］`);
   note('');
   note('Base:');
   note(`  ${row.branch} @ ${baseCommit.slice(0, 8)}`);
@@ -2252,13 +2319,14 @@ function cmdHelp() {
 
 自检：
   agentctl init                      项目内初始化：探测平台生成 platforms.json、补 .gitignore 排除（幂等不覆盖）
+  agentctl whoami                    查看当前会话的 agent 自识别结果（env / 进程链）
   agentctl doctor                    Git / 仓库 / 平台 worktree / 任务 registry / Agent CLI / AGENTS.md
   agentctl agent list                列出内置 Agent runner 与检测结果
   agentctl platform list             列出平台 registry（探测 + .agents/config/platforms.json 声明）
   agentctl task current              判断当前目录处于 Coordinator 还是 Worker 模式
 
 任务：
-  agentctl task create --platform <平台> --agent <agent> [--title <文本>] [--task <id>] [选项]
+  agentctl task create --platform <平台> [--agent <agent>] [--title <文本>] [--task <id>] [选项]
       创建任务分支 agent/<agent>/<task-id> 与独立任务 worktree
       <worktree_root>/<platform>/<task-id>，写入 .agents/tasks/<id>.json 与任务上下文 .agents/TASK.md。
       task id 缺省时按标题自动生成（<平台>-<slug>-NNN，同名递增）。
@@ -2344,6 +2412,7 @@ function main() {
   configInit();
 
   if (cmd === 'init') return cmdInit(rest);
+  if (cmd === 'whoami') return cmdWhoami(rest);
   if (cmd === 'doctor') return cmdDoctor(rest);
   if (cmd === 'platform') {
     const sub = rest[0] || 'list';
