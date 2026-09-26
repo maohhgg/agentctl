@@ -5,6 +5,43 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Merge commits now carry only a subject line.** `task integrate` used to
+  append a five-line body — `Task: <id>（agent <name>）`, `分支：<branch> → <main>`,
+  and a listing of every commit the merge brought in. That body was tool runtime
+  metadata, not a description of the change: the task id and branch no longer
+  resolve to anything once the worktree is reclaimed, and the commit listing
+  restated what the subject already says while growing without bound. The
+  subject is now the whole message, so `git log` reads
+  `chore(merge): 合并 <平台> · <任务标题>` and nothing else.
+- **`task update-base` merge commits keep only the base-advance line.** The
+  `基点：<old> → <new>` line stays — it is the one durable fact about that
+  merge, showing how far the baseline moved — while the `Task:` and `分支：`
+  metadata lines are gone.
+- **Long task titles no longer break the subject line.** An over-long title
+  could push `chore(merge):` past the 72-character limit the project's own
+  commit-msg rule enforces. The subject is now clipped to 72 characters
+  (counted in code points, never mid-character), with the prefix
+  `chore(merge): 合并 <平台> · ` taking its share of the budget first.
+
+### Fixed
+
+- **`task integrate` no longer misreports non-conflict merge failures as
+  conflicts**: when `git merge` failed for any reason, `MERGE_HEAD` is
+  present, so the old code took the conflict branch and printed an empty
+  `Conflicted files:` list. A conflict is now only reported — and the task
+  only moved to `conflict` — when `git diff --diff-filter=U` actually lists
+  unresolved files. Other failures (e.g. a `pre-merge-commit` hook refusing
+  the merge commit, or a merge commit object that cannot be written) leave
+  the task in `failed`, and report the leftover merge with the exact ways to
+  finish or abort it.
+- **Merge failure messages now carry git's actual output** instead of only
+  pointing at `git status`, on all three merge-related failure paths (initial
+  merge, non-conflict failure, and the follow-up merge commit).
+
 ## [0.0.3] - 2026-09-19
 
 ### Added

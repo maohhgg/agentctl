@@ -1802,8 +1802,7 @@ function cmdTaskUpdateBase(argv) {
       process.exit(1);
     }
     note('冲突已解决，收尾基点更新合并…');
-    const [ubSubject, ubBody] = updateBaseMergeMessage(task, row, platformTip);
-    const commit = git(['-C', task.worktree, 'commit', '-m', ubSubject, '-m', ubBody]);
+    const commit = git(['-C', task.worktree, 'commit', ...updateBaseMergeMessage(task, row, platformTip)]);
 
     if (commit.status !== 0) die(`收尾合并提交失败（cd ${task.worktree} && git status 查看）`);
     finishUpdateBase(task, platformTip, flags.has('--dry-run'));
@@ -1823,8 +1822,7 @@ function cmdTaskUpdateBase(argv) {
     return;
   }
   note(`平台分支领先任务基点 ${behind} 个提交（任务分支领先 ${ahead} 个），合并中…`);
-  const [ubSubject, ubBody] = updateBaseMergeMessage(task, row, platformTip);
-  const res = git(['-C', task.worktree, 'merge', '-m', ubSubject, '-m', ubBody, row.branch]);
+  const res = git(['-C', task.worktree, 'merge', ...updateBaseMergeMessage(task, row, platformTip), row.branch]);
 
   if (res.status !== 0) {
     if (mergeInProgress(task.worktree)) {
@@ -2111,52 +2109,62 @@ function cmdTaskMergeCheck(argv) {
   process.exit(1);
 }
 
-// 合并提交信息：主题行对齐仓库既有 conventional 风格（type(scope): 一句话结论），
-// 正文留任务身份与带入提交清单——git log / git show 一眼可追溯是哪次任务集成。
-const MERGE_LOG_LIMIT = 30;
+// 合并提交信息：主题行对齐仓库既有 conventional 风格（type(scope): 一句话结论）。
+// 正文刻意留空：Task id / 分支名是工具运行时元数据，worktree 回收后已无对应实体；
+// 「带入提交清单」又与主题行描述同一件事，重复且会随历史增长把提交信息撑到不可读。
+// 主题行按项目 commit-msg 规则（type(scope): 后正文 ≤72 字符）封顶：
+// 前缀（`chore(merge): 合并 <平台> · `）先占额度，剩下的才留给任务标题，
+// 截断点落在代码点边界（Array.from）上，不切碎多字节字符。
+const SUBJECT_MAX = 72;
 
 function oneLine(text, fallback) {
   const first = String(text == null ? '' : text).split('\n')[0].trim();
   return first || fallback;
 }
 
-function commitSubjects(base, tip) {
-  // 时间正序（旧 → 新）：合并信息里的清单按开发推进顺序读
-  const res = git(['log', '--no-merges', '--reverse', '--format=%h %s', `${base}..${tip}`]);
-  return res.status === 0 ? lines(res.stdout) : [];
+function clipSubject(prefix, text) {
+  const head = Array.from(prefix);
+  const body = Array.from(text);
+  if (head.length + body.length <= SUBJECT_MAX) return `${prefix}${text}`;
+  const keep = Math.max(SUBJECT_MAX - head.length - 1, 0);
+  return `${prefix}${body.slice(0, keep).join('')}…`;
 }
 
-function integrateMergeMessage(task, row, tip) {
-  const base = git(['merge-base', row.branch, tip]).stdout.trim();
-  const brought = base ? commitSubjects(base, tip) : [];
-  const body = [
-    `Task: ${task.id}${task.agent ? `（agent ${task.agent}）` : ''}`,
-    `分支：${task.task_branch} → ${row.branch}`,
-    brought.length === 0 ? '带入提交：无' : `带入 ${brought.length} 个提交：`,
-    ...brought.slice(0, MERGE_LOG_LIMIT).map((l) => `  ${l}`),
-    ...(brought.length > MERGE_LOG_LIMIT ? [`  … 另有 ${brought.length - MERGE_LOG_LIMIT} 个提交`] : []),
-  ];
-  return [`chore(merge): 合并 ${task.platform} · ${oneLine(task.title, task.id)}`, body.join('\n')];
+// 两个函数都直接返回 `git -m` 的参数片段（`['-m', subject]` 或 `['-m', subject, '-m', body']`），
+// 调用点拼接即可；没有正文时也不会塞一个空 `-m ''` 给 git。
+function integrateMergeMessage(task) {
+  return ['-m', clipSubject(`chore(merge): 合并 ${task.platform} · `, oneLine(task.title, task.id))];
 }
 
 function updateBaseMergeMessage(task, row, newBase) {
+  // 只留基点推进：回看历史时能看出基线前移了多少，这是这次合并唯一的信息量；
+  // Task id 与分支名同属运行时元数据，不入历史。
   return [
-    `chore(update-base): 刷新任务基点至 ${row.branch} 最新`,
-    [
-      `Task: ${task.id}`,
-      `分支：${row.branch} → ${task.task_branch}`,
-      `基点：${(task.base_commit || '').slice(0, 8)} → ${newBase.slice(0, 8)}`,
-    ].join('\n'),
+    '-m', `chore(update-base): 刷新任务基点至 ${row.branch} 最新`,
+    '-m', `基点：${(task.base_commit || '').slice(0, 8)} → ${newBase.slice(0, 8)}`,
   ];
 }
 
 // ============================ integrate ============================
+
+// git 失败时 stdout/stderr 才是真正的原因，必须原样带给用户（不能只说「去看 git status」）
+function gitFailureDetail(res) {
+  const text = `${(res.stderr || '').trim()}\n${(res.stdout || '').trim()}`.trim();
+  return text === '' ? '（git 未输出任何信息）' : text;
+}
 
 function platformCleanOrDie(row) {
   const st = git(['-C', ROOT, 'status', '--porcelain']).stdout;
   if (st.trim() !== '') {
     die(`主 checkout 存在未提交改动，拒绝 integrate（agentctl 不会执行 reset / checkout / merge / rebase 等可能破坏你状态的操作）：\n${ROOT}\n${st.trim()}\n\n请先提交或清理工作区，再重试。`);
   }
+}
+
+// git merge 失败后仍「在合并中」但没有任何未解决文件：典型是 pre-merge-commit 钩子失败，
+// 或 ort 策略中途放弃——都不是真冲突。MERGE_HEAD 存在本身无法区分真冲突与其它失败，
+// 只有未解决文件清单能。
+function unmergedPaths(wt) {
+  return lines(git(['-C', wt, 'diff', '--name-only', '--diff-filter=U']).stdout);
 }
 
 function cmdTaskIntegrate(argv) {
@@ -2190,7 +2198,7 @@ function cmdTaskIntegrate(argv) {
     warn('任务 worktree 存在未提交改动：本次只合并任务分支，这些改动不会被合并。');
   }
 
-  const [mergeSubject, mergeBody] = integrateMergeMessage(task, row, tip);
+  const mergeMsg = integrateMergeMessage(task);
 
   if (mergeInProgress(ROOT)) {
     // 进行中的 merge：仅当是本任务冲突的续做才放行
@@ -2198,7 +2206,8 @@ function cmdTaskIntegrate(argv) {
     if (mergeHead !== tip) {
       die(`主 checkout 存在其他进行中的 merge（MERGE_HEAD=${mergeHead.slice(0, 8)}，本任务 ${tip.slice(0, 8)}）：请先收尾或放弃（cd ${ROOT} && git merge --abort）`);
     }
-    const unmerged = lines(git(['-C', ROOT, 'diff', '--name-only', '--diff-filter=U']).stdout);
+    // 续做路径：MERGE_HEAD 指向本任务 tip，且没有未解决文件 = 冲突已解决（或钩子失败留下的空合并）
+    const unmerged = unmergedPaths(ROOT);
     if (unmerged.length > 0) {
       updateTask(task.id, { status: 'conflict' });
       note(`Merge 仍在进行中（${task.task_branch} → ${row.branch}），以下文件冲突尚未解决：`);
@@ -2209,32 +2218,43 @@ function cmdTaskIntegrate(argv) {
     }
     note('冲突已解决，收尾合并提交…');
     updateTask(task.id, { status: 'integrating' });
-    const commit = git(['-C', ROOT, 'commit', '-m', mergeSubject, '-m', mergeBody]);
+    const commit = git(['-C', ROOT, 'commit', ...mergeMsg]);
     if (commit.status !== 0) {
       updateTask(task.id, { status: 'failed' });
-      die(`收尾合并提交失败（cd ${ROOT} && git status 查看）`);
+      die(`收尾合并提交失败（cd ${ROOT} && git status 查看）：\n${gitFailureDetail(commit)}`);
     }
   } else {
     platformCleanOrDie(row);
     note(`Integrating: ${task.task_branch} → ${row.branch}（${relToRoot(ROOT)}）`);
     updateTask(task.id, { status: 'integrating' });
-    const res = git(['-C', ROOT, 'merge', '--no-ff', '-m', mergeSubject, '-m', mergeBody, task.task_branch]);
+    const res = git(['-C', ROOT, 'merge', '--no-ff', ...mergeMsg, task.task_branch]);
     if (res.status !== 0) {
-      if (mergeInProgress(ROOT)) {
+      // 只有存在未解决文件才算真冲突：git merge 因任何原因失败时都可能残留 MERGE_HEAD
+      // （主 checkout 有会被覆盖的未提交修改、pre-merge-commit 钩子失败等），
+      // 此时 --diff-filter=U 为空，不能报 CONFLICT、更不能把状态置成 conflict。
+      const conflicted = mergeInProgress(ROOT) ? unmergedPaths(ROOT) : [];
+      if (conflicted.length > 0) {
         updateTask(task.id, { status: 'conflict' });
-        const conflicted = lines(git(['-C', ROOT, 'diff', '--name-only', '--diff-filter=U']).stdout);
         note('');
         note('Merge CONFLICT：主 checkout 中保留了进行中的 merge（未回退、未丢弃任何内容）。');
         note('');
         note('Conflicted files:');
         note(conflicted.map((f) => `  ${f}`).join('\n'));
         note('');
+        note('git 输出：');
+        note(gitFailureDetail(res).split('\n').map((l) => `  ${l}`).join('\n'));
+        note('');
         note(`解决后：cd ${ROOT} && git add <files>，再执行 ${SELF} task integrate ${task.id} 收尾提交并标记 merged。`);
         note(`放弃本次合并：cd ${ROOT} && git merge --abort（然后 ${SELF} task set-status ${task.id} ready）`);
         process.exit(1);
       }
       updateTask(task.id, { status: 'failed' });
-      die(`merge 失败（cd ${ROOT} && git status 查看）\n${(res.stderr || res.stdout).trim()}`);
+      const leftover = mergeInProgress(ROOT)
+        ? `\n\ngit 留下了一个没有冲突文件的进行中 merge（未回退任何内容）：\n` +
+          `  收尾：${SELF} task integrate ${task.id}（需先让 git status 干净或先 fix 上述原因）\n` +
+          `  放弃：cd ${ROOT} && git merge --abort`
+        : '';
+      die(`merge 失败（cd ${ROOT} && git status 查看）：\n${gitFailureDetail(res)}${leftover}`);
     }
   }
 

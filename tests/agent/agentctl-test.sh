@@ -6,6 +6,7 @@
 # + <type>/<平台>-<slug> 任务分支 + 独立 worktree，含 --type 白名单校验）、TASK.md 任务上下文（含不进业务提交）、
 # allowed_paths 范围检查、scope 重叠检测、finish 门禁（相关检查收窄 {filter} / {files} 与超时）
 # 与 Worker 完成摘要、merge-check（只读）、integrate（在主 checkout 内并入 main，含冲突续做）、
+# integrate 失败判据（无真实冲突时不得误报 CONFLICT、错误信息须带 git 原始输出）、
 # update-base（基点推进与冲突续做）、adopt（注册表重建）、手工合并放行回收、回收规则、
 # init（.gitignore 排除项 / 幂等 / 不代写平台配置）、agent 自识别（whoami / env / flag 优先级）、
 # 平台目录内建任务告警、AgentRunner（自动启动与降级），以及四个并发场景：
@@ -322,9 +323,46 @@ assert_file_content '主干已含 task-a 内容' "$REPO/apps/api/src/shared/conf
 [[ "$(json_get "$REPO/.agents/tasks/task-a.json" merged_into)" == main ]] && pass '记录 merged_into=main' || fail '记录 merged_into=main'
 [[ "$(g log --merges --oneline main | wc -l | tr -d ' ')" != 0 ]] && pass '主干出现 merge commit' || fail '主干出现 merge commit'
 [[ "$(g rev-parse --abbrev-ref HEAD)" == main ]] && pass '主 checkout 停在 main' || fail '主 checkout 停在 main'
-g log -1 --format=%B main | grep -q '^chore(merge): 合并 api · Task A$' && pass '合并提交主题行 = chore(merge): 合并 <平台> · <任务标题>' || fail '合并提交主题行 = chore(merge): 合并 <平台> · <任务标题>' "subject=$(g log -1 --format=%s main)"
-g log -1 --format=%B main | grep -q '^Task: task-a（agent codex）$' && pass '合并提交正文记 Task id 与 agent' || fail '合并提交正文记 Task id 与 agent'
-g log -1 --format=%B main | grep -q 'feat(a): config from task-a' && pass '合并提交正文列带入的提交' || fail '合并提交正文列带入的提交'
+# 合并提交信息只留主题行：Task id / 分支名是工具运行时元数据（worktree 回收后已无对应实体），
+# 「带入提交清单」又与主题行描述同一件事，都不入历史。
+MERGE_SUBJECT="$(g log -1 --format=%s main)"
+MERGE_BODY_LINES="$(g log -1 --format=%b main | grep -c . || true)"
+[[ "$MERGE_SUBJECT" == 'chore(merge): 合并 api · Task A' ]] &&
+  pass '合并提交主题行 = chore(merge): 合并 <平台> · <任务标题>' ||
+  fail '合并提交主题行 = chore(merge): 合并 <平台> · <任务标题>' "实际：$MERGE_SUBJECT"
+[[ "$MERGE_BODY_LINES" == 0 ]] &&
+  pass '合并提交正文为空（不带 Task/分支/带入提交清单）' ||
+  fail '合并提交正文为空（不带 Task/分支/带入提交清单）' "正文非空行数=$MERGE_BODY_LINES｜$(g log -1 --format=%b main)"
+[[ "${#MERGE_SUBJECT}" -le 72 ]] &&
+  pass '合并提交主题行不超过 72 字符' ||
+  fail '合并提交主题行不超过 72 字符' "长度=${#MERGE_SUBJECT}"
+
+# 边界：任务标题超长时，主题行必须自己截断守住 commit-msg 的 ≤72 字符规则，
+# 否则 agentctl 生成的提交会顶破项目自己的提交信息约束。
+section '11.1. 超长任务标题：合并主题行截断，正文仍为空'
+run task create --platform api --agent codex --task task-longtitle \
+  --title 'Rework the entire authentication layer including SSO, SAML and token refresh across every platform with a very long descriptive tail' \
+  --allowed-paths 'apps/api/src/longtitle/**'
+assert_rc '创建超长标题任务' 0
+mkdir -p "$WTROOT/api/task-longtitle/apps/api/src/longtitle"
+printf 'export const longTitle = "1";\n' >"$WTROOT/api/task-longtitle/apps/api/src/longtitle/flag.ts"
+gw "$WTROOT/api/task-longtitle" add apps/api/src/longtitle/flag.ts
+gw "$WTROOT/api/task-longtitle" commit -qm 'feat(longtitle): flag'
+run task finish task-longtitle --test-command true
+assert_rc 'task-longtitle finish 通过' 0
+run task integrate task-longtitle
+assert_rc '超长标题任务 integrate' 0
+LONG_SUBJECT="$(g log -1 --format=%s main)"
+LONG_BODY_LINES="$(g log -1 --format=%b main | grep -c . || true)"
+[[ "${#LONG_SUBJECT}" -le 72 ]] &&
+  pass '超长标题的合并主题行仍 ≤72 字符' ||
+  fail '超长标题的合并主题行仍 ≤72 字符' "长度=${#LONG_SUBJECT}：$LONG_SUBJECT"
+[[ "$LONG_SUBJECT" == 'chore(merge): 合并 api · '*'…' ]] &&
+  pass '超长标题按 72 字符截断并以省略号收尾' ||
+  fail '超长标题按 72 字符截断并以省略号收尾' "实际：$LONG_SUBJECT"
+[[ "$LONG_BODY_LINES" == 0 ]] &&
+  pass '超长标题的合并提交正文仍为空' ||
+  fail '超长标题的合并提交正文仍为空' "正文非空行数=$LONG_BODY_LINES｜$(g log -1 --format=%b main)"
 
 section '12. Case 3：merge-check 发现冲突且不污染主 checkout'
 HEAD_BEFORE="$(g rev-parse main)"
@@ -371,6 +409,79 @@ run task integrate task-z --force
 assert_rc_nonzero '主 checkout 脏 → integrate 拒绝'
 assert_err_contains '拒绝原因说明主 checkout 不干净' '未提交改动'
 g checkout -- apps/api/src/index.ts
+[[ -z "$(g status --porcelain)" ]] && pass '恢复主 checkout 清洁' || fail '恢复主 checkout 清洁'
+
+# 回归（线上现象）：`git merge` 失败时可能仍留下 MERGE_HEAD、却没有任何未解决文件
+# （典型：合并提交对象写不出来 —— pre-merge-commit 钩子拒绝、提交签名失败）。
+# 修复前：误报 CONFLICT + 状态置 conflict，「Conflicted files:」为空，
+# 用户完全看不到 git 的真实原因（状态还从 active 翻成 failed 再翻成 merged）。
+section '14.5. integrate：merge 失败但无真实冲突（不得误报 CONFLICT）'
+run task create --platform backend --agent codex --task task-mergefail --title 'Merge Failure' \
+  --allowed-paths 'apps/api/src/mergefail/**'
+assert_rc '创建 task-mergefail' 0
+mkdir -p "$WTROOT/api/task-mergefail/apps/api/src/mergefail"
+printf 'export const flag = "merge-fail";\n' >"$WTROOT/api/task-mergefail/apps/api/src/mergefail/flag.ts"
+gw "$WTROOT/api/task-mergefail" add apps/api/src/mergefail/flag.ts
+gw "$WTROOT/api/task-mergefail" commit -qm 'feat: merge fail flag'
+run task finish task-mergefail --test-command true
+assert_rc 'task-mergefail finish 通过' 0
+cat >"$REPO/.git/hooks/pre-merge-commit" <<'HOOK'
+#!/bin/sh
+echo "merge hook: refuse to create the merge commit (simulates a failing gate)" >&2
+exit 1
+HOOK
+chmod +x "$REPO/.git/hooks/pre-merge-commit"
+run task integrate task-mergefail
+MERGEFAIL_OUT="$OUT"
+MERGEFAIL_ERR="$ERR"
+rm -f "$REPO/.git/hooks/pre-merge-commit"
+[[ -n "$(g rev-parse -q --verify MERGE_HEAD 2>/dev/null)" ]] &&
+  pass '夹具成立：git 残留了进行中 merge' || fail '夹具成立：git 残留了进行中 merge'
+[[ -z "$(g diff --name-only --diff-filter=U)" ]] &&
+  pass '夹具成立：却没有任何未解决文件（不是冲突）' || fail '夹具成立：却没有任何未解决文件（不是冲突）'
+assert_rc_nonzero 'merge 失败时 integrate 退出码非 0'
+[[ "$MERGEFAIL_OUT" != *CONFLICT* ]] &&
+  pass '无真实冲突时不得报 CONFLICT' || fail '无真实冲突时不得报 CONFLICT' "stdout: $MERGEFAIL_OUT"
+[[ "$(json_get "$REPO/.agents/tasks/task-mergefail.json" status)" == failed ]] &&
+  pass '无真实冲突时状态置 failed（非 conflict）' || fail '无真实冲突时状态置 failed（非 conflict）' "status=$(json_get "$REPO/.agents/tasks/task-mergefail.json" status)"
+[[ "$MERGEFAIL_ERR" == *"Not committing merge; use 'git commit' to complete the merge."* ]] &&
+  pass '错误信息含 git 原始输出：未创建合并提交' || fail '错误信息含 git 原始输出：未创建合并提交' "stderr: $MERGEFAIL_ERR"
+[[ "$MERGEFAIL_ERR" == *'merge hook: refuse to create the merge commit'* ]] &&
+  pass '错误信息含钩子的真实原因（而非只让用户去看 git status）' || fail '错误信息含钩子的真实原因（而非只让用户去看 git status）' "stderr: $MERGEFAIL_ERR"
+[[ "$MERGEFAIL_ERR" == *'task integrate task-mergefail'* ]] &&
+  pass '提示残留的进行中 merge 可重跑收尾' || fail '提示残留的进行中 merge 可重跑收尾' "stderr: $MERGEFAIL_ERR"
+[[ "$MERGEFAIL_ERR" == *'git merge --abort'* ]] &&
+  pass '提示残留的进行中 merge 可放弃' || fail '提示残留的进行中 merge 可放弃' "stderr: $MERGEFAIL_ERR"
+[[ -z "$(json_get "$REPO/.agents/tasks/task-mergefail.json" merged_commit)" ]] &&
+  pass '失败后未记录 merged_commit（不得标记为已合并）' || fail '失败后未记录 merged_commit（不得标记为已合并）'
+if g -C "$REPO" merge --abort 2>/dev/null; then
+  pass '残留 merge 可用 git merge --abort 放弃'
+else
+  fail '残留 merge 可用 git merge --abort 放弃'
+fi
+[[ -z "$(g status --porcelain)" ]] && pass '恢复主 checkout 清洁' || fail '恢复主 checkout 清洁'
+
+# 配套守卫：主 checkout 有未提交改动时 merge 根本不该启动，更不能退化成 CONFLICT 误报
+# （线上正是这类脏改动被藏住后，integrate 才走到了 git merge 并误报的）。
+section '14.6. integrate：主 checkout 有未提交改动时拒绝 integrate 且不得误报 CONFLICT'
+run task create --platform backend --agent omp --task task-mergehook --title 'Merge Hook' \
+  --allowed-paths 'apps/api/src/mergehook/**'
+assert_rc '创建 task-mergehook' 0
+mkdir -p "$WTROOT/api/task-mergehook/apps/api/src/mergehook"
+printf 'export const flag = "merge-hook";\n' >"$WTROOT/api/task-mergehook/apps/api/src/mergehook/flag.ts"
+gw "$WTROOT/api/task-mergehook" add apps/api/src/mergehook/flag.ts
+gw "$WTROOT/api/task-mergehook" commit -qm 'feat: merge hook flag'
+run task finish task-mergehook --test-command true
+assert_rc 'task-mergehook finish 通过' 0
+printf 'export const index = "uncommitted-local";\n' >"$REPO/apps/api/src/index.ts"
+run task integrate task-mergehook --force
+HOOK_OUT="$OUT"
+HOOK_ERR="$ERR"
+g checkout -- apps/api/src/index.ts
+assert_rc_nonzero '主 checkout 脏 → integrate 仍拒绝'
+[[ "$HOOK_OUT" != *CONFLICT* ]] && pass '未提交改动被拒时不得报 CONFLICT' || fail '未提交改动被拒时不得报 CONFLICT' "stdout: $HOOK_OUT"
+[[ "$HOOK_ERR" == *'未提交改动'* ]] && pass '拒绝原因说明主 checkout 不干净' || fail '拒绝原因说明主 checkout 不干净' "stderr: $HOOK_ERR"
+[[ -z "$(g rev-parse -q --verify MERGE_HEAD 2>/dev/null)" ]] && pass '拒绝后未残留进行中 merge' || fail '拒绝后未残留进行中 merge'
 [[ -z "$(g status --porcelain)" ]] && pass '恢复主 checkout 清洁' || fail '恢复主 checkout 清洁'
 
 section '15. case 1：两个 agent 同时创建任务（并发安全）'
