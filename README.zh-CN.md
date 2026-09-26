@@ -18,27 +18,42 @@ checkout 时会互相覆盖文件、互相污染 git 状态——分支隔离解
 一个 Node 脚本零第三方依赖；并且让 **agent 自己** 充当 Coordinator / Worker——
 只需读仓库内的文件即可自组织。
 
-## 工作方式——两级 worktree 模型
+## 工作方式——两种仓库形态
+
+**Monorepo 单主线**（四端同处一棵工作树，`main` 是唯一长期分支）：
+
+```
+主 checkout（整个仓库：apps/api、apps/web、docs）
+ │
+ └── 任务 worktree  ../my-repo-agent-worktrees/api/api-google-oauth-001
+                     @ feat/api-google-oauth-001                 ← 一个 agent
+ │
+ └── 任务 worktree  ../my-repo-agent-worktrees/web/web-payment-002
+                     @ fix/web-payment-002                       ← 另一个 agent
+```
+
+**多 worktree**（每个交付目标一条平台分支与一个平台 worktree）：
 
 ```
 主 checkout（枢纽：文档 / 契约 / 协调）
  │
  └── 平台 worktree   wt/backend @ feature/backend      ← integration 边界
-      │                 只做 merge / test / review / release，agent 不在此开发
+      │                 只做 merge / test / review / release
       │
-      ├── 任务 worktree  ../my-repo-agent-worktrees/backend/backend-google-oauth-001
-      │                  @ agent/backend-google-oauth-001      ← 一个 agent
-      │
-      └── 任务 worktree  ../my-repo-agent-worktrees/backend/backend-payment-002
-                         @ agent/backend-payment-002            ← 另一个 agent
+      └── 任务 worktree  ../my-repo-agent-worktrees/backend/backend-google-oauth-001
+                          @ feat/backend-google-oauth-001
 ```
 
-- **平台 worktree**（长期存在，每个交付目标一个：backend / web / 移动端…）：
-  在 `.agents/config/platforms.json` 声明，或由 `git worktree list` 自动探测；
-  是唯一的集成边界。
+- **平台**：本质是**一段范围**，不必然是 worktree。在
+  `.agents/config/platforms.json` 声明——monorepo 里平台只是一组路径
+  （`"api": { "paths": ["apps/api"] }`），所有平台都集成回 `main`；多 worktree
+  仓库里平台额外是「worktree + 分支」（`"worktree": "wt/backend",
+  "branch": "feature/backend"`），可由 `git worktree list` 自动探测。两种形态下，
+  任务都受 `--allowed-paths` 约束，集成一律落到平台分支。
 - **任务 worktree**（一条任务一个）：一条任务分支 + 一个独立 checkout +
-  一个 agent。由 agentctl 创建与回收；任务上下文 `.agents/TASK.md` 写在其中，
-  经 `.git/info/exclude` 排除、不进业务提交。
+  一个 agent。分支命名 `<type>/<平台>-<slug>`，type 取 Conventional Commits
+  的 type（`task create --type`，默认 `feat`）。由 agentctl 创建与回收；
+  任务上下文 `.agents/TASK.md` 写在其中，经 `.git/info/exclude` 排除、不进业务提交。
 
 物理隔离解决覆盖问题；逻辑冲突留给 Git 在集成阶段暴露。agentctl 刻意
 **不做文件锁**。
@@ -209,14 +224,20 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 ```jsonc
 {
   "worktree_root": "../my-repo-agent-worktrees",  // 缺省 ../<仓库名>-agent-worktrees
-  "branch_prefix": "agent",                        // 缺省 agent
+  "main_branch": "main",                          // 缺省 main —— monorepo 的集成分支
   "platforms": {
+    // monorepo：平台就是一组路径，集成回 main
     "backend": {
-      "worktree": "wt/backend",        // 必填：平台 worktree 路径（相对仓库根）
-      "branch": "feature/backend",     // 必填：其集成分支
+      "paths": ["apps/backend"],      // 必填：平台目录范围
       "aliases": ["api"],              // 可选：--platform 接受的别名
       "test_command": "composer test", // task finish 的默认测试门禁
       "test_timeout": 300              // 可选：测试挂起 N 秒后强杀
+    },
+    // 多 worktree：再补平台 worktree 与分支
+    "web": {
+      "paths": ["apps/web"],
+      "worktree": "wt/web",            // 可选：平台 worktree 路径
+      "branch": "feature/web"          // 可选：其集成分支
     }
   }
 }

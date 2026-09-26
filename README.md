@@ -23,28 +23,44 @@ themselves** can act as coordinator and workers by reading files in the repo.
 
 ---
 
-## How it works — the two-level worktree model
+## How it works — two repository shapes
+
+**Monorepo, single mainline** (four apps in one tree, `main` is the only long-lived branch):
+
+```
+main checkout (the whole repo: apps/api, apps/web, docs)
+ │
+ └── task worktree  ../my-repo-agent-worktrees/api/api-google-oauth-001
+                     @ feat/api-google-oauth-001                 ← one agent
+ │
+ └── task worktree  ../my-repo-agent-worktrees/web/web-payment-002
+                     @ fix/web-payment-002                       ← another agent
+```
+
+**Multi-worktree** (one platform branch and worktree per deliverable):
 
 ```
 main checkout (hub: docs, contracts, coordination)
  │
  └── platform worktree   wt/backend @ feature/backend          ← integration boundary
-      │                     only merge / test / review / release happen here;
-      │                     agents never develop here
+      │                     only merge / test / review / release happen here
       │
-      ├── task worktree  ../my-repo-agent-worktrees/backend/backend-google-oauth-001
-      │                     @ agent/backend-google-oauth-001      ← one agent
-      │
-      └── task worktree  ../my-repo-agent-worktrees/backend/backend-payment-002
-                           @ agent/backend-payment-002            ← another agent
+      └── task worktree  ../my-repo-agent-worktrees/backend/backend-google-oauth-001
+                          @ feat/backend-google-oauth-001
 ```
 
-- **Platform worktree** — long-lived, one per deliverable target (backend, web,
-  mobile…). Registered in `.agents/config/platforms.json` or auto-detected from
-  `git worktree list`.
+- **Platform** — a *scope*, not necessarily a worktree. Declare it in
+  `.agents/config/platforms.json`; in a monorepo a platform is just a set of
+  paths (`"api": { "paths": ["apps/api"] }`) and every platform integrates into
+  `main`. In a multi-worktree repo a platform is additionally a worktree plus
+  its branch (`"worktree": "wt/backend", "branch": "feature/backend"`),
+  auto-detected from `git worktree list`. Whichever fits, tasks are confined by
+  `--allowed-paths` and integration always targets the platform's branch.
 - **Task worktree** — one per task: one task branch + one isolated checkout +
-  one agent. Created and reclaimed by agentctl. A task brief (`.agents/TASK.md`)
-  is written into it and kept out of commits via `.git/info/exclude`.
+  one agent. Branches are named `<type>/<platform>-<slug>`, where `type` is a
+  Conventional Commits type (`task create --type`, default `feat`). Created and
+  reclaimed by agentctl. A task brief (`.agents/TASK.md`) is written into it and
+  kept out of commits via `.git/info/exclude`.
 
 Physical isolation prevents overwriting; logical conflicts are left to Git at
 integration time. agentctl deliberately implements **no file locks**.
@@ -226,14 +242,20 @@ generates it from detected worktrees):
 ```jsonc
 {
   "worktree_root": "../my-repo-agent-worktrees",  // default: ../<repo>-agent-worktrees
-  "branch_prefix": "agent",                        // default: agent
+  "main_branch": "main",                          // default: main — monorepo integration target
   "platforms": {
+    // monorepo: a platform is a set of paths; integration goes to main
     "backend": {
-      "worktree": "wt/backend",      // required: platform worktree path
-      "branch": "feature/backend",   // required: its integration branch
+      "paths": ["apps/backend"],    // required: platform directory scope
       "aliases": ["api"],            // optional: extra names accepted by --platform
       "test_command": "composer test", // default test gate for task finish
       "test_timeout": 300              // optional: kill hung test runs after N seconds
+    },
+    // multi-worktree: add the platform's worktree and branch
+    "web": {
+      "paths": ["apps/web"],
+      "worktree": "wt/web",          // optional: platform worktree path
+      "branch": "feature/web",       // optional: its integration branch
     }
   }
 }
