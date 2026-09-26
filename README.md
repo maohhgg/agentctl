@@ -33,10 +33,10 @@ main checkout (hub: docs, contracts, coordination)
       │                     agents never develop here
       │
       ├── task worktree  ../my-repo-agent-worktrees/backend/backend-google-oauth-001
-      │                     @ agent/codex/backend-google-oauth-001   ← one agent
+      │                     @ agent/backend-google-oauth-001      ← one agent
       │
       └── task worktree  ../my-repo-agent-worktrees/backend/backend-payment-002
-                            @ agent/omp/backend-payment-002         ← another agent
+                           @ agent/backend-payment-002            ← another agent
 ```
 
 - **Platform worktree** — long-lived, one per deliverable target (backend, web,

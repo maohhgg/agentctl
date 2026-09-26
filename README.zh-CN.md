@@ -27,10 +27,10 @@ checkout 时会互相覆盖文件、互相污染 git 状态——分支隔离解
       │                 只做 merge / test / review / release，agent 不在此开发
       │
       ├── 任务 worktree  ../my-repo-agent-worktrees/backend/backend-google-oauth-001
-      │                  @ agent/codex/backend-google-oauth-001   ← 一个 agent
+      │                  @ agent/backend-google-oauth-001      ← 一个 agent
       │
       └── 任务 worktree  ../my-repo-agent-worktrees/backend/backend-payment-002
-                         @ agent/omp/backend-payment-002          ← 另一个 agent
+                         @ agent/backend-payment-002            ← 另一个 agent
 ```
 
 - **平台 worktree**（长期存在，每个交付目标一个：backend / web / 移动端…）：

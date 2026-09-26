@@ -163,12 +163,12 @@ run task create --platform backend --agent codex --task task-a --title 'Task A' 
   --objective '为 backend 增加 A 功能' --requirements '实现登录;补充测试' --allowed-paths 'src/shared/**'
 assert_rc '创建 task-a' 0
 assert_out_contains '输出 Task created.' 'Task created.'
-assert_out_contains '输出任务分支' 'agent/codex/task-a'
+assert_out_contains '输出任务分支' 'agent/backend-task-a'
 assert_out_contains '输出 TASK.md 路径' 'TASK.md'
 assert_exists 'task-a worktree 建在仓库同级目录' "$WTROOT/backend/task-a"
 assert_absent 'worktree 未落在仓库内' "$REPO/.agents-worktrees"
 assert_exists 'task-a 元数据已写入' "$REPO/.agents/tasks/task-a.json"
-assert_exists 'task-a 分支已创建' "$REPO/.git/refs/heads/agent/codex/task-a"
+assert_exists 'task-a 分支已创建' "$REPO/.git/refs/heads/agent/backend-task-a"
 [[ "$(json_get "$REPO/.agents/tasks/task-a.json" platform)" == backend ]] && pass '元数据 platform=backend' || fail '元数据 platform=backend'
 [[ "$(json_get "$REPO/.agents/tasks/task-a.json" status)" == active ]] && pass '元数据 status=active' || fail '元数据 status=active'
 [[ "$(json_get "$REPO/.agents/tasks/task-a.json" allowed_paths.0)" == 'src/shared/**' ]] && pass '元数据 allowed_paths 落盘' || fail '元数据 allowed_paths 落盘'
@@ -227,8 +227,8 @@ gw "$WTROOT/backend/task-a" add src/shared/config.ts
 gw "$WTROOT/backend/task-a" commit -qm 'feat(a): config from task-a'
 gw "$WTROOT/backend/task-b" add src/shared/config.ts
 gw "$WTROOT/backend/task-b" commit -qm 'feat(b): config from task-b'
-[[ "$(g rev-list --count backend..agent/codex/task-a)" == 1 ]] && pass 'task-a 独立提交 1 个 commit' || fail 'task-a 独立提交 1 个 commit'
-[[ "$(g rev-list --count backend..agent/claude/task-b)" == 1 ]] && pass 'task-b 独立提交 1 个 commit' || fail 'task-b 独立提交 1 个 commit'
+[[ "$(g rev-list --count backend..agent/backend-task-a)" == 1 ]] && pass 'task-a 独立提交 1 个 commit' || fail 'task-a 独立提交 1 个 commit'
+[[ "$(g rev-list --count backend..agent/backend-task-b)" == 1 ]] && pass 'task-b 独立提交 1 个 commit' || fail 'task-b 独立提交 1 个 commit'
 [[ "$(g rev-list --count backend)" == 1 ]] && pass '平台分支未被 agent 直接提交' || fail '平台分支未被 agent 直接提交'
 [[ "$(gw "$WTROOT/backend/task-a" show --name-only --oneline HEAD | grep -c 'TASK.md')" == 0 ]] &&
   pass '业务提交内不含 TASK.md' || fail '业务提交内不含 TASK.md'
@@ -308,6 +308,9 @@ assert_file_content '平台分支已含 task-a 内容' "$REPO/wt/backend/src/sha
 [[ "$(json_get "$REPO/.agents/tasks/task-a.json" merged_into)" == backend ]] && pass '记录 merged_into=backend' || fail '记录 merged_into=backend'
 [[ "$(g log --merges --oneline backend | wc -l | tr -d ' ')" != 0 ]] && pass '平台分支出现 merge commit' || fail '平台分支出现 merge commit'
 [[ "$(g rev-parse --abbrev-ref HEAD)" == master ]] && pass '未污染主 checkout 的分支' || fail '未污染主 checkout 的分支'
+g log -1 --format=%B backend | grep -q '^merge(backend): Task A$' && pass '合并提交主题行 = merge(<平台>): <任务标题>' || fail '合并提交主题行 = merge(<平台>): <任务标题>' "subject=$(g log -1 --format=%s backend)"
+g log -1 --format=%B backend | grep -q '^Task: task-a（agent codex）$' && pass '合并提交正文记 Task id 与 agent' || fail '合并提交正文记 Task id 与 agent'
+g log -1 --format=%B backend | grep -q 'feat(a): config from task-a' && pass '合并提交正文列带入的提交' || fail '合并提交正文列带入的提交'
 
 section '12. Case 3：merge-check 发现冲突且不污染平台 worktree'
 HEAD_BEFORE="$(g rev-parse backend)"
@@ -370,8 +373,8 @@ set -e
 [[ "$RC1" == 0 && "$RC2" == 0 ]] && pass '并发创建两个任务都成功' || fail '并发创建两个任务都成功' "rc=$RC1/$RC2　$(cat "$WORK/p1.out" "$WORK/p2.out")"
 assert_exists '并发任务 1 worktree' "$WTROOT/backend/backend-parallel-one-001"
 assert_exists '并发任务 2 worktree' "$WTROOT/backend/backend-parallel-two-001"
-if g show-ref --verify --quiet refs/heads/agent/codex/backend-parallel-one-001 &&
-  g show-ref --verify --quiet refs/heads/agent/omp/backend-parallel-two-001; then
+if g show-ref --verify --quiet refs/heads/agent/backend-parallel-one-001 &&
+  g show-ref --verify --quiet refs/heads/agent/backend-parallel-two-001; then
   pass '并发任务分支各自存在'
 else
   fail '并发任务分支各自存在'
@@ -404,7 +407,7 @@ assert_exists '拒绝后 worktree 仍在' "$WTROOT/backend/task-z"
 run task remove task-a
 assert_rc '已 merged 且干净 → 自动回收' 0
 assert_absent 'worktree 已回收' "$WTROOT/backend/task-a"
-assert_absent '任务分支已删除' "$REPO/.git/refs/heads/agent/codex/task-a"
+assert_absent '任务分支已删除' "$REPO/.git/refs/heads/agent/backend-task-a"
 assert_absent '任务记录已删除' "$REPO/.agents/tasks/task-a.json"
 printf 'leftover\n' >"$WTROOT/backend/task-z/src/index.ts"
 run task remove task-z --force
@@ -443,6 +446,12 @@ run task create --platform backend --agent codex --title 'Alias Task' --allowed-
 assert_rc '别名 backend → 平台 api' 0
 [[ "$(json_get "$REPO/.agents/tasks/api-alias-task-001.json" platform)" == api ]] && pass '任务记录使用声明平台 id' || fail '任务记录使用声明平台 id'
 [[ "$(json_get "$REPO/.agents/tasks/api-alias-task-001.json" test_command)" == '' ]] && pass '未显式指定时 test_command 走平台配置' || fail '未显式指定时 test_command 走平台配置'
+run task create --platform backend --agent codex --task backend-alias-flat-001 --title '别名归一' --allowed-paths 'src/other/flat/**'
+assert_rc '创建带别名前缀的 task id' 0
+assert_out_contains '分支名用平台规范 id（别名 backend → api）' 'agent/api-alias-flat-001'
+assert_exists '归一后分支已创建' "$REPO/.git/refs/heads/agent/api-alias-flat-001"
+assert_absent '旧格式分支未创建' "$REPO/.git/refs/heads/agent/codex/backend-alias-flat-001"
+run task remove backend-alias-flat-001 --force
 run task create --platform shared-name --agent codex --title 'Amb Task'
 assert_rc_nonzero '别名歧义 → 拒绝'
 assert_err_contains '歧义报错列出候选' '有歧义'
@@ -563,7 +572,7 @@ section '23. 手工合并放行回收、finish 相关检查超时与 worktree_ro
 printf 'export const login = "manual";\n' >"$WTROOT/backend/task-y/src/auth/login.ts"
 gw "$WTROOT/backend/task-y" add src/auth/login.ts
 gw "$WTROOT/backend/task-y" commit -qm 'feat(auth): manual work'
-g -C "$REPO/wt/backend" merge --no-ff -m 'manual: task-y' agent/omp/task-y
+g -C "$REPO/wt/backend" merge --no-ff -m 'manual: task-y' agent/backend-task-y
 run task remove task-y
 assert_rc '分支已并入平台 → 放行回收' 0
 assert_out_contains '放行说明' '放行回收'

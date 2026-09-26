@@ -8,7 +8,7 @@
 //       —— 平台级 integration 边界：只做 merge / test / debug / review / release，
 //          不作为 Coding Agent 的日常开发目录。
 //   Agent 任务 worktree（Task Worktree，一条任务一个）
-//       ../<repo>-agent-worktrees/<platform>/<task-id> @ agent/<agent>/<task-id>
+//       ../<repo>-agent-worktrees/<platform>/<task-id> @ agent/<platform>-<slug>
 //       —— 单个 Agent 的独立开发工作区，物理文件隔离由 git worktree 提供，
 //          内含 .agents/TASK.md 作为当前任务上下文（由 .git/info/exclude 排除，不进业务提交）。
 //
@@ -587,6 +587,13 @@ function nextTaskId(platformId, title) {
   }
   die(`无法为 ${base} 生成 task id（序号已用尽）`);
 }
+
+// 任务分支名：agent/<platform>-<slug>——平台用规范 id，task-id 的别名前缀（如 backend-）在此归一
+function taskBranchName(row, taskId) {
+  const alias = aliasesFor(row).find((a) => taskId.startsWith(`${a}-`));
+  return `${BRANCH_PREFIX}/${row.id}-${alias ? taskId.slice(alias.length + 1) : taskId}`;
+}
+
 
 // ============================ scope 重叠检测 ============================
 
@@ -1285,7 +1292,8 @@ function cmdTaskCreate(argv) {
   // task id 生成 + 注册表写入 + worktree 创建在同一临界区内完成，避免并发 create 撞名
   const result = withRegistryLock(() => {
     const taskId = vals['--task'] || nextTaskId(row.id, title);
-    const taskBranch = `${BRANCH_PREFIX}/${agent}/${taskId}`;
+    const taskBranch = taskBranchName(row, taskId);
+
     const wtPath = path.join(WORKTREE_ROOT, row.id, taskId);
     const file = taskPath(taskId);
 
@@ -1858,7 +1866,9 @@ function cmdTaskUpdateBase(argv) {
       process.exit(1);
     }
     note('冲突已解决，收尾基点更新合并…');
-    const commit = git(['-C', task.worktree, 'commit', '--no-edit']);
+    const [ubSubject, ubBody] = updateBaseMergeMessage(task, row, platformTip);
+    const commit = git(['-C', task.worktree, 'commit', '-m', ubSubject, '-m', ubBody]);
+
     if (commit.status !== 0) die(`收尾合并提交失败（cd ${task.worktree} && git status 查看）`);
     finishUpdateBase(task, platformTip, flags.has('--dry-run'));
     return;
@@ -1868,7 +1878,8 @@ function cmdTaskUpdateBase(argv) {
   const ahead = task.base_commit ? revListCount(`${task.base_commit}..refs/heads/${task.task_branch}`) : 0;
   if (flags.has('--dry-run')) {
     note(`[dry-run] 平台分支领先任务基点 ${behind} 个提交；任务分支领先 ${ahead} 个提交。`);
-    note(`[dry-run] 将执行：cd ${task.worktree} && git merge --no-edit ${row.branch}`);
+    note(`[dry-run] 将执行：cd ${task.worktree} && git merge ${row.branch}（agentctl 自动生成 merge-base 提交信息）`);
+
     return;
   }
   if (behind === 0) {
@@ -1876,7 +1887,9 @@ function cmdTaskUpdateBase(argv) {
     return;
   }
   note(`平台分支领先任务基点 ${behind} 个提交（任务分支领先 ${ahead} 个），合并中…`);
-  const res = git(['-C', task.worktree, 'merge', '--no-edit', row.branch]);
+  const [ubSubject, ubBody] = updateBaseMergeMessage(task, row, platformTip);
+  const res = git(['-C', task.worktree, 'merge', '-m', ubSubject, '-m', ubBody, row.branch]);
+
   if (res.status !== 0) {
     if (mergeInProgress(task.worktree)) {
       const conflicted = lines(git(['-C', task.worktree, 'diff', '--name-only', '--diff-filter=U']).stdout);
@@ -2162,6 +2175,45 @@ function cmdTaskMergeCheck(argv) {
   process.exit(1);
 }
 
+// 合并提交信息：主题行对齐仓库既有 conventional 风格（type(scope): 一句话结论），
+// 正文留任务身份与带入提交清单——git log / git show 一眼可追溯是哪次任务集成。
+const MERGE_LOG_LIMIT = 30;
+
+function oneLine(text, fallback) {
+  const first = String(text == null ? '' : text).split('\n')[0].trim();
+  return first || fallback;
+}
+
+function commitSubjects(base, tip) {
+  // 时间正序（旧 → 新）：合并信息里的清单按开发推进顺序读
+  const res = git(['log', '--no-merges', '--reverse', '--format=%h %s', `${base}..${tip}`]);
+  return res.status === 0 ? lines(res.stdout) : [];
+}
+
+function integrateMergeMessage(task, row, tip) {
+  const base = git(['merge-base', row.branch, tip]).stdout.trim();
+  const brought = base ? commitSubjects(base, tip) : [];
+  const body = [
+    `Task: ${task.id}${task.agent ? `（agent ${task.agent}）` : ''}`,
+    `分支：${task.task_branch} → ${row.branch}`,
+    brought.length === 0 ? '带入提交：无' : `带入 ${brought.length} 个提交：`,
+    ...brought.slice(0, MERGE_LOG_LIMIT).map((l) => `  ${l}`),
+    ...(brought.length > MERGE_LOG_LIMIT ? [`  … 另有 ${brought.length - MERGE_LOG_LIMIT} 个提交`] : []),
+  ];
+  return [`merge(${task.platform}): ${oneLine(task.title, task.id)}`, body.join('\n')];
+}
+
+function updateBaseMergeMessage(task, row, newBase) {
+  return [
+    `merge-base(${task.platform}): 刷新任务基点至 ${row.branch} 最新`,
+    [
+      `Task: ${task.id}`,
+      `分支：${row.branch} → ${task.task_branch}`,
+      `基点：${(task.base_commit || '').slice(0, 8)} → ${newBase.slice(0, 8)}`,
+    ].join('\n'),
+  ];
+}
+
 // ============================ integrate ============================
 
 function platformCleanOrDie(row) {
@@ -2202,6 +2254,8 @@ function cmdTaskIntegrate(argv) {
     warn('任务 worktree 存在未提交改动：本次只合并任务分支，这些改动不会被合并。');
   }
 
+  const [mergeSubject, mergeBody] = integrateMergeMessage(task, row, tip);
+
   if (mergeInProgress(row.worktree)) {
     // 进行中的 merge：仅当是本任务冲突的续做才放行
     const mergeHead = git(['-C', row.worktree, 'rev-parse', 'MERGE_HEAD']).stdout.trim();
@@ -2219,7 +2273,8 @@ function cmdTaskIntegrate(argv) {
     }
     note('冲突已解决，收尾合并提交…');
     updateTask(task.id, { status: 'integrating' });
-    const commit = git(['-C', row.worktree, 'commit', '--no-edit']);
+    const commit = git(['-C', row.worktree, 'commit', '-m', mergeSubject, '-m', mergeBody]);
+
     if (commit.status !== 0) {
       updateTask(task.id, { status: 'failed' });
       die(`收尾合并提交失败（cd ${row.worktree} && git status 查看）`);
@@ -2228,7 +2283,7 @@ function cmdTaskIntegrate(argv) {
     platformCleanOrDie(row);
     note(`Integrating: ${task.task_branch} → ${row.branch}（${relToRoot(row.worktree)}）`);
     updateTask(task.id, { status: 'integrating' });
-    const res = git(['-C', row.worktree, 'merge', '--no-ff', '-m', `merge(agent): 合并 ${task.task_branch} 至 ${row.branch}`, task.task_branch]);
+    const res = git(['-C', row.worktree, 'merge', '--no-ff', '-m', mergeSubject, '-m', mergeBody, task.task_branch]);
     if (res.status !== 0) {
       if (mergeInProgress(row.worktree)) {
         updateTask(task.id, { status: 'conflict' });
@@ -2360,14 +2415,13 @@ function cmdDoctor(argv) {
       ? `${WORKTREE_ROOT} 位于主 checkout 内部，任务 worktree 会污染主 checkout 的 git status；建议在 .agents/config/platforms.json 把 worktree_root 配置为仓库外的同级目录`
       : WORKTREE_ROOT);
 
-  // agent/<agent>/<task-id> 分支存在但没有注册表记录 → 注册表被误删的孤儿
+  // agent/<platform>-<slug> 分支存在但不在任何任务记录里 → 注册表被误删的孤儿
+  // （以记录里的 task_branch 为准：旧格式分支同样算已登记，不误报）
+  const registeredBranches = new Set(tasks.map((t) => t.task_branch).filter(Boolean));
   const orphanBranches = git(['-C', ROOT, 'branch', '--format=%(refname:short)'])
     .stdout.split('\n')
     .map((s) => s.trim())
-    .filter((b) => b.startsWith(`${BRANCH_PREFIX}/`))
-    .map((b) => ({ branch: b, id: b.slice(BRANCH_PREFIX.length + 1).split('/').pop() }))
-    .filter((e) => e.id && !isFile(taskPath(e.id)))
-    .map((e) => e.branch);
+    .filter((b) => b.startsWith(`${BRANCH_PREFIX}/`) && !registeredBranches.has(b));
   add('Orphan task branches', orphanBranches.length === 0,
     orphanBranches.length
       ? `${orphanBranches.length} 条未登记：${orphanBranches.join('　')}（在对应 worktree 内运行 agentctl task adopt 可恢复）`
@@ -2442,7 +2496,7 @@ function cmdHelp() {
 
 任务：
   agentctl task create --platform <平台> [--agent <agent>] [--title <文本>] [--task <id>] [选项]
-      创建任务分支 agent/<agent>/<task-id> 与独立任务 worktree
+      创建任务分支 agent/<平台>-<slug> 与独立任务 worktree
       <worktree_root>/<platform>/<task-id>，写入 .agents/tasks/<id>.json 与任务上下文 .agents/TASK.md。
       task id 缺省时按标题自动生成（<平台>-<slug>-NNN，同名递增）。
       选项：
