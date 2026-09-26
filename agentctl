@@ -508,11 +508,29 @@ function listTasks() {
     .sort();
 }
 
-function effectiveTestCommand(task) {
+function platformEntry(task) {
+  return CONFIG.platforms && task && typeof task.platform === 'string' ? CONFIG.platforms[task.platform] : null;
+}
+
+// finish 相关检查（scoped）的命令模板：任务级 test_command > 平台 test_command。
+// 模板支持 {filter}（相关用例过滤串）与 {files}（相关文件路径）两个占位符。
+function effectiveTestTemplate(task) {
   if (task && typeof task.test_command === 'string' && task.test_command) return task.test_command;
-  const entry = CONFIG.platforms && task ? CONFIG.platforms[task.platform] : null;
+  const entry = platformEntry(task);
   if (entry && typeof entry.test_command === 'string') return entry.test_command;
   return '';
+}
+
+// 相关用例的取材范围：本次改动中命中平台 test_globs 的文件
+function platformTestGlobs(task) {
+  const entry = platformEntry(task);
+  return entry && Array.isArray(entry.test_globs) ? entry.test_globs.filter((g) => typeof g === 'string' && g) : [];
+}
+
+// 全量检查命令：只作提示，不进 finish 门禁
+function platformGlobalTestCommand(task) {
+  const entry = platformEntry(task);
+  return entry && typeof entry.test_command_global === 'string' ? entry.test_command_global : '';
 }
 
 // finish 测试超时秒数：命令行 > 任务记录 > 平台配置；无配置返回 0（不限时）
@@ -686,6 +704,59 @@ function allowedBlock(allowed, indent = '  ') {
   return allowed.map((a) => `${indent}${a}`).join('\n');
 }
 
+// ============================ finish 相关检查（scoped） ============================
+// finish 门禁只跑「与该任务改动相关」的检查，不跑全量：
+//   取材 = 任务声明（--test-filter / 任务字段 test_filter）优先，否则取本次改动中命中
+//          平台 test_globs 的文件；
+//   形态 = 平台 test_command 模板：{filter} → 相关用例过滤串（后端 = phpunit --filter，
+//          取命中文件的类名/文件名，多个以 | 连接）；{files} → 相关文件路径（前端 = 对
+//          改动文件跑 eslint）。
+// 全量检查（平台 test_command_global）不进 finish 门禁，是否执行由 Worker 自行判断。
+function resolveTestSelector(task, changed, overrideFilter) {
+  const declared = (overrideFilter !== undefined
+    ? overrideFilter
+    : typeof task.test_filter === 'string' ? task.test_filter : ''
+  ).trim();
+  if (declared) return { source: 'declared', value: declared };
+  const globs = platformTestGlobs(task);
+  if (globs.length === 0) return { source: 'none', reason: '平台未配置 test_globs，且任务未声明 --test-filter' };
+  // 已删除的文件不进选择子：检查工具对不存在的路径会直接报错
+  const files = changed.filter((f) => isFile(path.join(task.worktree, f)) && globs.some((g) => matchAllowed(g, f)));
+  if (files.length === 0) return { source: 'none', reason: '本次改动未命中平台 test_globs（已删除的文件不计入）' };
+  return { source: 'derived', files };
+}
+
+function buildScopedCheckCommand(task, changed, overrideFilter) {
+  const template = effectiveTestTemplate(task);
+  if (!template) return { command: '', reason: '平台未配置 test_command' };
+  const wantsFilter = template.includes('{filter}');
+  const wantsFiles = template.includes('{files}');
+  if (!wantsFilter && !wantsFiles) return { command: template };
+  const sel = resolveTestSelector(task, changed, overrideFilter);
+  if (sel.source === 'none') {
+    return { command: '', reason: `${sel.reason}（可用 --test-filter <选择子> 或 --test-command '<命令>' 显式指定）` };
+  }
+  const declared = sel.source === 'declared';
+  // 声明的选择子：{files} 原样作为单个参数（shell 转义，避免被 shell 提前展开），
+  // {filter} 由模板自带引号包裹，故原样注入
+  const filesValue = declared ? shellQuote(sel.value) : sel.files.map(shellQuote).join(' ');
+  const filterValue = declared
+    ? sel.value
+    : sel.files.map((f) => path.basename(f).replace(/\.[^.]+$/, '')).join('|');
+  const command = template.replaceAll('{files}', filesValue).replaceAll('{filter}', filterValue);
+  return { command, selector: sel };
+}
+
+// 人类可读预览（create / show / TASK.md）：未声明的选择子留占位提示，不凭空编造
+function scopedCheckPreview(task) {
+  const template = effectiveTestTemplate(task);
+  if (!template) return '';
+  const declared = typeof task.test_filter === 'string' ? task.test_filter.trim() : '';
+  return template
+    .replaceAll('{filter}', declared || '<本次改动推导>')
+    .replaceAll('{files}', declared || '<本次改动命中的文件>');
+}
+
 // ============================ TASK.md（任务上下文） ============================
 
 function taskContextPath(worktree) {
@@ -714,6 +785,9 @@ function taskContextContent(task) {
     task.allowed_paths.length > 0
       ? `Allowed paths:\n${task.allowed_paths.map((p) => `- ${p}`).join('\n')}`
       : 'Allowed paths: 未限定（提交前必须用 `agentctl task check` 校验实际改动，不得触碰无关模块）';
+  const scoped = scopedCheckPreview(task);
+  const globalCmd = platformGlobalTestCommand(task);
+  const declaredFilter = typeof task.test_filter === 'string' && task.test_filter ? task.test_filter : '';
   return `# Current Task
 
 Task ID: ${task.id}
@@ -724,6 +798,7 @@ Task Branch: ${task.task_branch}
 Worktree: ${task.worktree}
 Status: ${task.status}
 Created: ${task.created_at}
+Test Filter: ${declaredFilter}
 
 ## Objective
 
@@ -748,7 +823,8 @@ ${others.length ? others.join('\n') : '  - （本次仅注册了一个平台）'
 
 ## Completion Criteria
 
-- 相关测试通过（\`agentctl task finish\` 会按平台 test_command 校验）。
+- 相关检查通过（\`agentctl task finish\` 只跑与该任务改动相关的检查${scoped ? `：\`${scoped}\`` : ''}）。
+- 全量检查${globalCmd ? `（\`${globalCmd}\`）` : ''}**不进 finish 门禁**：跑不跑由你自行判断；若跑了，在完成说明里写清结果。
 - \`git diff\` 复核过（\`agentctl task diff ${task.id}\`）。
 - 无越界文件（\`agentctl task check ${task.id}\` 通过）。
 - 改动已提交在任务分支 \`${task.task_branch}\`。
@@ -1098,7 +1174,7 @@ function cmdInit(argv) {
     note('  git worktree add <目录> -b <集成分支>    # 例：git worktree add wt/main -b feature/main');
     note('然后在 .agents/config/platforms.json 里声明该平台，或重跑 agentctl init 自动登记。');
   } else {
-    note('已登记平台（可在 platforms.json 里补 aliases / test_command）：');
+    note('已登记平台（可在 platforms.json 里补 aliases / test_command / test_globs / test_command_global）：');
     printTable(['PLATFORM', 'BRANCH', 'WORKTREE'], registered.map((r) => [r.id, r.branch, r.worktree]));
     note('');
     note('下一步：');
@@ -1156,7 +1232,7 @@ function warnIfInPlatformWorktree() {
 
 function cmdTaskCreate(argv) {
   const { vals, flags } = parseFlags(argv, {
-    value: ['--platform', '--agent', '--task', '--title', '--objective', '--requirements', '--allowed-paths', '--feature', '--parent', '--test-command', '--timeout'],
+    value: ['--platform', '--agent', '--task', '--title', '--objective', '--requirements', '--allowed-paths', '--feature', '--parent', '--test-command', '--test-filter', '--timeout'],
     bool: ['--start', '--allow-overlap', '--dry-run'],
   });
   const platformName = vals['--platform'];
@@ -1237,6 +1313,7 @@ function cmdTaskCreate(argv) {
       feature: vals['--feature'] || null,
       parent_task: vals['--parent'] || null,
       test_command: vals['--test-command'] || null,
+      test_filter: vals['--test-filter'] || null,
       test_timeout: parseTimeoutArg(vals['--timeout']),
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -1303,8 +1380,10 @@ function cmdTaskCreate(argv) {
   note('Allowed paths:');
   note(allowedBlock(allowed));
   note('');
-  note('Test command:');
-  note(`  ${effectiveTestCommand(task) || '（未配置：finish 时跳过测试检查）'}`);
+  note('相关检查（finish 门禁）:');
+  note(`  ${scopedCheckPreview(task) || '（平台未配置 test_command：finish 时跳过相关检查）'}`);
+  const globalHint = platformGlobalTestCommand(task);
+  if (globalHint) note(`  全量检查（可选，不入 finish 门禁）：${globalHint}`);
   note('');
   note('Check scope:');
   note(`  ${SELF} task check ${task.id}`);
@@ -1463,7 +1542,8 @@ function cmdTaskShow(argv) {
   note(`Updated:    ${task.updated_at || '—'}`);
   if (task.finished_commit) note(`Finished:   ${task.finished_commit.slice(0, 8)}`);
   if (task.merged_into) note(`Merged:     ${(task.merged_commit || '').slice(0, 8)} → ${task.merged_into}`);
-  note(`Test cmd:   ${effectiveTestCommand(task) || '—'}`);
+  note(`Check:      ${scopedCheckPreview(task) || '—'}　（finish 门禁：只跑相关用例）`);
+  note(`Check all:  ${platformGlobalTestCommand(task) || '—'}　（可选，不入门禁）`);
   note('Allowed paths:');
   note(allowedBlock(task.allowed_paths));
   if (task.requirements.length) {
@@ -1575,7 +1655,7 @@ function cmdTaskDiff(argv) {
 // ============================ task finish ============================
 
 function cmdTaskFinish(argv) {
-  const { vals, flags, positional } = parseFlags(argv, { value: ['--test-command', '--timeout'], bool: ['--no-test'] });
+  const { vals, flags, positional } = parseFlags(argv, { value: ['--test-command', '--test-filter', '--timeout'], bool: ['--no-test'] });
   const id = positional[0];
   if (!id) usageError('task finish 需要 task id');
   const task = readTask(id);
@@ -1618,44 +1698,51 @@ function cmdTaskFinish(argv) {
   if (ahead <= 0) failures.push(`任务分支相对 base（${(task.base_commit || '').slice(0, 8)}）没有任何 commit`);
   note(`  [4/5] 提交数（base 之后）：${ahead}（${okFail(ahead > 0)}）`);
 
-  // [5/5] 测试
+  // [5/5] 相关检查（scoped）：只跑与该任务改动相关的用例；全量检查由 Worker 自行判断
   let testState;
   let testCommand = '';
   if (flags.has('--no-test')) {
     testState = 'skipped（--no-test）';
+  } else if (vals['--test-command'] !== undefined) {
+    testCommand = vals['--test-command'];
   } else {
-    testCommand = vals['--test-command'] !== undefined ? vals['--test-command'] : effectiveTestCommand(task);
+    const built = buildScopedCheckCommand(task, changed, vals['--test-filter']);
+    testCommand = built.command;
     if (!testCommand) {
-      testState = 'skipped（未配置测试命令）';
-    } else {
-      const timeoutSec = vals['--timeout'] !== undefined ? parseTimeoutArg(vals['--timeout']) : effectiveTestTimeout(task);
-      note(`  [5/5] 测试：${testCommand}${timeoutSec ? `（超时 ${timeoutSec}s）` : ''}`);
-      note('');
-      const spawnOpts = { cwd: task.worktree, stdio: 'inherit', env: process.env };
-      if (timeoutSec) {
-        spawnOpts.timeout = timeoutSec * 1000;
-        spawnOpts.killSignal = 'SIGTERM';
-      }
-      // POSIX 走 bash；Windows 原生走 PowerShell（无 bash 依赖）
-      const runner = process.platform === 'win32'
-        ? { cmd: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', testCommand] }
-        : { cmd: 'bash', args: ['-c', testCommand] };
-      const res = spawnSync(runner.cmd, runner.args, spawnOpts);
-      const timedOut = Boolean(timeoutSec) && Boolean(res.error) && res.error.code === 'ETIMEDOUT';
-      const rc = res.status === null ? 1 : res.status;
-      note('');
-      if (timedOut) {
-        testState = `FAIL（${testCommand}，超时 ${timeoutSec}s 被终止）`;
-        failures.push(`测试超时（${timeoutSec}s）：${testCommand}`);
-      } else if (rc === 0) {
-        testState = `OK（${testCommand}）`;
-      } else {
-        testState = `FAIL（${testCommand}，退出码 ${rc}）`;
-        failures.push(`测试未通过：${testCommand}（退出码 ${rc}）`);
-      }
+      testState = `skipped（${built.reason}）`;
+      warn(`相关检查未执行：${built.reason}`);
+      const globalCmd = platformGlobalTestCommand(task);
+      if (globalCmd) warn(`如需自证无回归，自行跑全量检查（不在 finish 门禁内）：${globalCmd}`);
     }
   }
-  note(`  [5/5] 测试：${testState}`);
+  if (testCommand) {
+    const timeoutSec = vals['--timeout'] !== undefined ? parseTimeoutArg(vals['--timeout']) : effectiveTestTimeout(task);
+    note(`  [5/5] 相关检查：${testCommand}${timeoutSec ? `（超时 ${timeoutSec}s）` : ''}`);
+    note('');
+    const spawnOpts = { cwd: task.worktree, stdio: 'inherit', env: process.env };
+    if (timeoutSec) {
+      spawnOpts.timeout = timeoutSec * 1000;
+      spawnOpts.killSignal = 'SIGTERM';
+    }
+    // POSIX 走 bash；Windows 原生走 PowerShell（无 bash 依赖）
+    const runner = process.platform === 'win32'
+      ? { cmd: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', testCommand] }
+      : { cmd: 'bash', args: ['-c', testCommand] };
+    const res = spawnSync(runner.cmd, runner.args, spawnOpts);
+    const timedOut = Boolean(timeoutSec) && Boolean(res.error) && res.error.code === 'ETIMEDOUT';
+    const rc = res.status === null ? 1 : res.status;
+    note('');
+    if (timedOut) {
+      testState = `FAIL（${testCommand}，超时 ${timeoutSec}s 被终止）`;
+      failures.push(`相关检查超时（${timeoutSec}s）：${testCommand}`);
+    } else if (rc === 0) {
+      testState = `OK（${testCommand}）`;
+    } else {
+      testState = `FAIL（${testCommand}，退出码 ${rc}）`;
+      failures.push(`相关检查未通过：${testCommand}（退出码 ${rc}）`);
+    }
+  }
+  note(`  [5/5] 相关检查：${testState}`);
   note('');
 
   if (failures.length > 0) {
@@ -1698,6 +1785,8 @@ function cmdTaskFinish(argv) {
   note('Changed files:');
   note(changed.length ? changed.map((c) => `  ${c}`).join('\n') : '  （无）');
   note(`Tests:     ${summary.tests}`);
+  const globalCmd = platformGlobalTestCommand(task);
+  if (globalCmd) note(`Check all: ${globalCmd}（可选，不在门禁内：是否执行由 Worker 自行判断）`);
   note(`Commit:    ${summary.commit_short}`);
   note(`Status:    ${summary.status}`);
   note('');
@@ -1869,6 +1958,7 @@ function cmdTaskAdopt(argv) {
   const taskBranch = field('Task Branch');
   const statusLine = field('Status');
   const created = field('Created');
+  const testFilter = field('Test Filter');
   validateSlug('task id', id);
   validateSlug('agent 名', agent);
   if (!platform || !baseBranch || !taskBranch) {
@@ -1928,6 +2018,7 @@ function cmdTaskAdopt(argv) {
     feature: null,
     parent_task: null,
     test_command: null,
+    test_filter: testFilter || null,
     test_timeout: null,
     created_at: created || new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -2361,8 +2452,10 @@ function cmdHelp() {
         --allowed-paths <glob,..>  允许改动的路径（相对任务 worktree 根；空 = 不检查范围）
         --feature <名称>           跨平台 feature 分组标记
         --parent <名称>            feature 内父级任务标记
-        --test-command '<cmd>'     finish 时执行的测试命令（默认取平台配置）
-        --timeout <秒>             finish 测试超时秒数（默认取平台 test_timeout）
+        --test-command '<cmd>'     finish 时执行的完整命令（覆盖平台 test_command 模板）
+        --test-filter <选择子>      finish 相关用例的选择子（后端 = phpunit --filter 模式；
+                                   前端 = 检查目标路径）。缺省时由本次改动命中平台 test_globs 的文件推导
+        --timeout <秒>             finish 相关检查超时秒数（默认取平台 test_timeout）
         --allow-overlap            与已有任务 scope 重叠时仍创建（显式确认）
         --dry-run                  只打印将创建的内容
         --start                    创建后立即启动 Worker（不可用时降级为打印命令）
@@ -2371,8 +2464,12 @@ function cmdHelp() {
   agentctl task start <id> [--dry-run]      按 AgentRunner 启动 Worker
   agentctl task check <id>                  校验实际改动是否越出 allowed_paths（越界退出码 1）
   agentctl task diff <id> [--stat|--name-only] [--working]
-  agentctl task finish <id> [--no-test] [--test-command '<cmd>'] [--timeout <秒>]
-      门禁：worktree 与分支正确、无未提交改动、改动未越界、至少一个 commit、测试通过。
+  agentctl task finish <id> [--no-test] [--test-command '<cmd>'] [--test-filter <选择子>] [--timeout <秒>]
+      门禁：worktree 与分支正确、无未提交改动、改动未越界、至少一个 commit、相关检查通过。
+      相关检查只跑与该任务改动相关的用例（平台 test_command 模板 + {filter}/{files} 占位符：
+      后端 = php artisan test --filter="…"，前端 = 对改动文件跑 eslint；选择子可用
+      --test-filter 覆盖，否则由改动命中平台 test_globs 的文件推导）。
+      全量检查（平台 test_command_global）不在门禁内，是否执行由 Worker 自行判断。
       通过后状态置 ready 并输出 Worker 完成摘要；不删除、不丢弃任何改动。
   agentctl task set-status <id> <status>    标记 blocked / failed / cancelled 等
       状态：${STATUSES.join(' / ')}

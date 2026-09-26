@@ -4,7 +4,7 @@
 #
 # 覆盖：doctor 自检、平台探测与声明、任务创建（显式 / 自动 task id + 任务分支 + 独立 worktree）、
 # TASK.md 任务上下文（含不进业务提交）、allowed_paths 范围检查、scope 重叠检测、
-# finish 门禁（含测试超时）与 Worker 完成摘要、merge-check（只读）、integrate（含冲突续做）、
+# finish 门禁（相关检查收窄 {filter} / {files} 与超时）与 Worker 完成摘要、merge-check（只读）、integrate（含冲突续做）、
 # update-base（基点推进与冲突续做）、adopt（注册表重建）、手工合并放行回收、回收规则、
 # init（配置生成 / gitignore / 幂等）、agent 自识别（whoami / env / flag 优先级）、
 # 平台 worktree 告警、AgentRunner（自动启动与降级），以及四个并发场景：
@@ -277,10 +277,10 @@ assert_file_content 'finish 失败不丢弃改动' "$WTROOT/backend/task-a/src/s
 gw "$WTROOT/backend/task-a" add src/shared/config.ts
 gw "$WTROOT/backend/task-a" commit -qm 'feat(a): follow-up'
 run task finish task-a --test-command false
-assert_rc_nonzero '测试失败 → finish 拒绝'
-assert_err_contains '拒绝原因含测试未通过' '测试未通过'
+assert_rc_nonzero '相关检查失败 → finish 拒绝'
+assert_err_contains '拒绝原因含相关检查未通过' '相关检查未通过'
 run task finish task-a --test-command true
-assert_rc '测试通过 + 干净 + 范围内 → finish 通过' 0
+assert_rc '相关检查通过 + 干净 + 范围内 → finish 通过' 0
 assert_out_contains 'finish 输出 Worker 完成摘要' 'Task completed.'
 assert_out_contains '摘要含 Changed files' 'Changed files:'
 assert_out_contains '摘要含 Tests' 'Tests:'
@@ -558,7 +558,7 @@ assert_rc_nonzero '记录已存在 → 拒绝重复 adopt'
 run doctor
 assert_out_contains 'adopt 后 doctor 恢复' 'Orphan task branches: OK'
 
-section '23. 手工合并放行回收、finish 测试超时与 worktree_root 守卫'
+section '23. 手工合并放行回收、finish 相关检查超时与 worktree_root 守卫'
 # 在 task-y 内提交，再绕过 agentctl 手工把分支并进平台分支 → remove 无需 --force 放行
 printf 'export const login = "manual";\n' >"$WTROOT/backend/task-y/src/auth/login.ts"
 gw "$WTROOT/backend/task-y" add src/auth/login.ts
@@ -569,10 +569,10 @@ assert_rc '分支已并入平台 → 放行回收' 0
 assert_out_contains '放行说明' '放行回收'
 assert_absent 'worktree 已回收' "$WTROOT/backend/task-y"
 assert_absent '任务记录已删除' "$REPO/.agents/tasks/task-y.json"
-# finish 测试超时
+# finish 相关检查超时
 run task finish "$UB" --test-command 'sleep 3' --timeout 1
-assert_rc_nonzero '测试超时 → finish 拒绝'
-assert_err_contains '报错说明超时' '测试超时'
+assert_rc_nonzero '相关检查超时 → finish 拒绝'
+assert_err_contains '报错说明超时' '相关检查超时'
 run task finish "$UB" --test-command true --timeout 60
 assert_rc '未触发的超时不影响 finish' 0
 # worktree_root 配置在仓库内部 → doctor 告警
@@ -586,7 +586,126 @@ JSON
 run doctor
 assert_out_contains 'worktree_root 在仓库内 → doctor 提示' '位于主 checkout 内部'
 
-section '24. agentctl init：生成配置、补 .gitignore、幂等'
+section '24. finish 相关检查（scoped）：{filter} / {files} 模板与全量提示'
+cat >"$REPO/.agents/config/platforms.json" <<'JSON'
+{
+  "platforms": {
+    "api": {
+      "worktree": "wt/backend",
+      "branch": "backend",
+      "aliases": ["backend"],
+      "test_command": "echo \"RUN filter={filter}\"",
+      "test_globs": ["tests/**"],
+      "test_command_global": "echo GLOBAL-SUITE"
+    },
+    "frontend": {
+      "worktree": "wt/web",
+      "branch": "web",
+      "aliases": ["web"],
+      "test_command": "echo \"RUN files={files}\"",
+      "test_globs": ["src/**"],
+      "test_command_global": "echo GLOBAL-LINT"
+    }
+  }
+}
+JSON
+# (a) 任务声明 --test-filter：模板替换 + TASK.md / 创建输出 / 全量提示
+run task create --platform backend --agent omp --task task-s1 --allowed-paths 'tests/**,src/s1/**' --test-filter 'Alpha|Beta'
+assert_rc '创建声明选择子的任务' 0
+assert_out_contains '创建输出相关检查（含声明选择子）' 'RUN filter=Alpha|Beta'
+assert_out_contains '创建输出全量检查提示' 'echo GLOBAL-SUITE'
+assert_file_contains 'TASK.md 记录声明的选择子' "$WTROOT/api/task-s1/.agents/TASK.md" 'Test Filter: Alpha|Beta'
+assert_file_contains 'TASK.md 含相关检查模板' "$WTROOT/api/task-s1/.agents/TASK.md" 'RUN filter=Alpha|Beta'
+assert_file_contains 'TASK.md 说明全量不在门禁内' "$WTROOT/api/task-s1/.agents/TASK.md" '不进 finish 门禁'
+printf 'alpha\n' >"$WTROOT/api/task-s1/tests/AlphaTest.php"
+gw "$WTROOT/api/task-s1" add tests/AlphaTest.php
+gw "$WTROOT/api/task-s1" commit -qm 'test(s1): alpha'
+run task finish task-s1
+assert_rc '声明的选择子 → 相关检查通过' 0
+assert_out_contains 'finish 按声明的选择子执行' 'RUN filter=Alpha|Beta'
+assert_out_contains '摘要提示全量为可选' 'Check all: echo GLOBAL-SUITE（可选'
+run task show task-s1
+assert_out_contains 'task show 显示相关检查' 'RUN filter=Alpha|Beta'
+assert_out_contains 'task show 显示全量检查' 'Check all:  echo GLOBAL-SUITE'
+# adopt 从 TASK.md 恢复声明的选择子
+rm "$REPO/.agents/tasks/task-s1.json"
+run -C "$WTROOT/api/task-s1" task adopt
+assert_rc 'adopt 重建 task-s1' 0
+[[ "$(json_get "$REPO/.agents/tasks/task-s1.json" test_filter)" == 'Alpha|Beta' ]] && pass 'test_filter 从 TASK.md 恢复' || fail 'test_filter 从 TASK.md 恢复'
+run task remove task-s1 --force
+assert_rc '清理 task-s1' 0
+# (b) 未声明选择子：由改动命中 test_globs 的文件推导（未命中的源文件不进选择子）
+run task create --platform backend --agent omp --task task-s2 --allowed-paths 'tests/**,src/s2/**'
+assert_rc '创建未声明选择子的任务' 0
+assert_out_contains '未声明时预览留占位提示' 'RUN filter=<本次改动推导>'
+mkdir -p "$WTROOT/api/task-s2/src/s2"
+printf 'gamma\n' >"$WTROOT/api/task-s2/tests/GammaTest.php"
+printf 'export const impl = 1;\n' >"$WTROOT/api/task-s2/src/s2/impl.ts"
+gw "$WTROOT/api/task-s2" add tests/GammaTest.php src/s2/impl.ts
+gw "$WTROOT/api/task-s2" commit -qm 'feat(s2): gamma + impl'
+run task finish task-s2
+assert_rc '派生的选择子 → 相关检查通过' 0
+assert_out_contains '选择子取自命中的测试文件' 'RUN filter=GammaTest'
+[[ "$OUT" != *'filter=impl'* ]] && pass '未命中 test_globs 的源文件不进选择子' || fail '未命中 test_globs 的源文件不进选择子'
+run task remove task-s2 --force
+assert_rc '清理 task-s2' 0
+# (c) 前端 {files}：对改动文件执行检查；--test-command 仍可原样覆盖
+run task create --platform web --agent omp --task task-s3 --allowed-paths 'src/a/**'
+assert_rc '创建前端任务' 0
+mkdir -p "$WTROOT/frontend/task-s3/src/a"
+printf 'export const a = 1;\n' >"$WTROOT/frontend/task-s3/src/a/a.ts"
+gw "$WTROOT/frontend/task-s3" add src/a/a.ts
+gw "$WTROOT/frontend/task-s3" commit -qm 'feat(a): a.ts'
+run task finish task-s3
+assert_rc '前端相关检查通过' 0
+assert_out_contains '前端按改动文件执行检查' 'RUN files=src/a/a.ts'
+assert_out_contains '前端摘要提示全量检查' 'Check all: echo GLOBAL-LINT（可选'
+run task finish task-s3 --test-command 'echo VERBATIM'
+assert_rc '--test-command 覆盖模板仍可原样执行' 0
+assert_out_contains '原样执行覆盖命令' 'VERBATIM'
+run task remove task-s3 --force
+assert_rc '清理 task-s3' 0
+# (d) 改动未命中 test_globs 且未声明选择子 → skipped（不静默、不升级为全量）；--test-filter 可补
+run task create --platform web --agent omp --task task-s4 --allowed-paths 'README.md'
+assert_rc '创建未命中 test_globs 的任务' 0
+printf 'more\n' >>"$WTROOT/frontend/task-s4/README.md"
+gw "$WTROOT/frontend/task-s4" add README.md
+gw "$WTROOT/frontend/task-s4" commit -qm 'docs: readme'
+run task finish task-s4
+assert_rc '无可推导的相关用例 → finish 仍通过' 0
+assert_out_contains '第 5 项记为 skipped 并给出原因' 'skipped（本次改动未命中平台 test_globs'
+assert_err_contains 'stderr 提示相关检查未执行' '相关检查未执行'
+assert_err_contains 'stderr 给出全量检查命令' 'echo GLOBAL-LINT'
+run task finish task-s4 --test-filter 'src/any/**'
+assert_rc '--test-filter 显式补出选择子' 0
+assert_out_contains '显式选择子替换占位符' "RUN files='src/any/**'"
+run task remove task-s4 --force
+assert_rc '清理 task-s4' 0
+# (e) 已删除的文件不进选择子（检查工具对不存在的路径直接报错）
+run task create --platform web --agent omp --task task-s5 --allowed-paths 'src/b/**'
+assert_rc '创建任务 task-s5' 0
+mkdir -p "$WTROOT/frontend/task-s5/src/b"
+printf 'export const b = 1;\n' >"$WTROOT/frontend/task-s5/src/b/b.ts"
+gw "$WTROOT/frontend/task-s5" add src/b/b.ts
+gw "$WTROOT/frontend/task-s5" commit -qm 'feat(b): b.ts'
+gw "$WTROOT/frontend/task-s5" rm -q src/b/b.ts
+mkdir -p "$WTROOT/frontend/task-s5/src/b"
+printf 'export const c = 1;\n' >"$WTROOT/frontend/task-s5/src/b/c.ts"
+gw "$WTROOT/frontend/task-s5" add src/b/c.ts
+gw "$WTROOT/frontend/task-s5" commit -qm 'refactor(b): b.ts → c.ts'
+run task finish task-s5
+assert_rc '删除 + 新增混合 → 相关检查通过' 0
+assert_out_contains '选择子只含仍存在的改动文件' 'RUN files=src/b/c.ts'
+[[ "$OUT" != *'b/b.ts'* ]] && pass '已删除的文件不进选择子' || fail '已删除的文件不进选择子'
+gw "$WTROOT/frontend/task-s5" rm -q src/b/c.ts
+gw "$WTROOT/frontend/task-s5" commit -qm 'chore(b): drop c.ts'
+run task finish task-s5
+assert_rc '全部删除 → finish 仍通过' 0
+assert_out_contains '无可选文件 → skipped' 'skipped（本次改动未命中平台 test_globs（已删除的文件不计入）'
+run task remove task-s5 --force
+assert_rc '清理 task-s5' 0
+
+section '25. agentctl init：生成配置、补 .gitignore、幂等'
 # 还原到「未初始化」状态：删平台配置、去掉 gitignore 排除项
 rm -f "$REPO/.agents/config/platforms.json"
 grep -v -e '^/\.agents/tasks/$' -e '^/\.agents/state/$' "$REPO/.gitignore" >"$REPO/.gitignore.tmp" && mv "$REPO/.gitignore.tmp" "$REPO/.gitignore"
@@ -614,7 +733,7 @@ cmp "$WORK/platforms.before.json" "$REPO/.agents/config/platforms.json" && pass 
 run doctor
 assert_out_contains 'doctor 确认 gitignore 排除' 'Runtime state gitignore: OK'
 
-section '26. agent 自识别：--agent 缺省时的解析与拒绝'
+section '27. agent 自识别：--agent 缺省时的解析与拒绝'
 # 拒绝用例仅在没有已知 agent 祖先时可测（如 CI；在 agent CLI 宿主内跳过）
 PROC_HIT=$("$AGENTCTL" --json whoami | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{console.log(JSON.parse(s).process||"")})')
 if [[ -z "$PROC_HIT" ]]; then
@@ -640,6 +759,6 @@ assert_rc 'whoami 退出码 0' 0
 run --json whoami
 assert_rc 'whoami --json 退出码 0' 0
 
-section '27. 结束'
+section '28. 结束'
 printf '\n通过 %d 项，失败 %d 项\n' "$PASS" "$FAILED"
 [[ "$FAILED" == 0 ]] || exit 1
