@@ -87,10 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `chore(merge): 合并 <平台> · ` taking its share of the budget first.
 - **CI prints failing assertions as annotations.** Job logs are only readable
   from a signed-in browser, so the workflow tees the suite output and re-emits
-  the `FAIL` lines plus the pass/fail tally as `::error::` annotations, which
-  are readable through the public check-runs API. It also prints `locale` in the
-  toolchain step — the only way to see why a platform you cannot run locally
-  (Windows) went red.
+  the `FAIL` lines, their details and the pass/fail tally as `::error::`
+  annotations (details are folded onto one line so the workflow command keeps
+  them whole), which are readable through the public check-runs API. It also
+  prints `locale` in the toolchain step — the only way to see why a platform you
+  cannot run locally (Windows) went red.
 
 ### Fixed
 

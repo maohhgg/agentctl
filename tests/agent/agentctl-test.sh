@@ -54,7 +54,12 @@ pass() {
 fail() {
   FAILED=$((FAILED + 1))
   printf 'FAIL %s\n' "$1"
-  [[ -n "${2:-}" ]] && printf '     %s\n' "$2"
+  if [[ -n "${2:-}" ]]; then
+    # 详情折成单行（换行 → ⏎）再截断：CI 会把它作为一条 annotation 发出，
+    # 多行详情在 workflow command 里会被截断，折行后 FAIL 行与详情一次性可见。
+    local d="${2//$'\n'/⏎}"
+    printf '     %s\n' "${d:0:2500}"
+  fi
   return 0
 }
 
@@ -68,10 +73,10 @@ run() {
 
 assert_rc() { if [[ "$RC" == "$2" ]]; then pass "$1"; else fail "$1" "退出码 期望=$2 实际=$RC｜stderr: $ERR"; fi; }
 assert_rc_nonzero() { if [[ "$RC" != 0 ]]; then pass "$1"; else fail "$1" '退出码应为非 0'; fi; }
-# 失败详情带实际输出（截断 12 行）：CI 的 job 日志要登录才能看，annotation 只带 FAIL 行，
-# 不带上实际输出就无法在本地复现不了的环境（Windows）上定位差异。
-assert_out_contains() { if [[ "$OUT" == *"$2"* ]]; then pass "$1"; else fail "$1" "stdout 未包含：$2｜实际：$(printf '%s' "$OUT" | head -12)"; fi; }
-assert_err_contains() { if [[ "$ERR" == *"$2"* ]]; then pass "$1"; else fail "$1" "stderr 未包含：$2｜实际：$(printf '%s' "$ERR" | head -12)"; fi; }
+# 失败详情带实际输出：CI 的 job 日志要登录才能看，annotation 只带 FAIL 行与详情行，
+# 不带上实际输出就无法在本地复现不了的环境（Windows）上定位差异（详情由 fail 折成单行）。
+assert_out_contains() { if [[ "$OUT" == *"$2"* ]]; then pass "$1"; else fail "$1" "stdout 未包含：$2｜实际：$OUT"; fi; }
+assert_err_contains() { if [[ "$ERR" == *"$2"* ]]; then pass "$1"; else fail "$1" "stderr 未包含：$2｜实际：$ERR"; fi; }
 
 # stdout 必须是可被 JSON.parse 的单一结果（--json 的契约）
 assert_out_json() {

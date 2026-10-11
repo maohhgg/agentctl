@@ -33,9 +33,10 @@ jobs:
       - name: Surface failures as annotations
         # job 日志在网页上要求登录才能读；annotation 走公开 API（check-runs）即可读，
         # 让无法本地复现的平台（如 Windows）失败时不用登录也能看到具体是哪条断言。
+        # 详情行（缩进 5 空格）与 FAIL 行一起发；测试侧已把详情折成单行，保证不被截断。
         if: failure()
         run: |
-          lines="$(grep -E '^(FAIL|通过 )' .test-output.log || tail -10 .test-output.log)"
-          printf '%s\n' "$lines" | head -10 | while IFS= read -r line; do
+          lines="$(grep -E '^(FAIL |通过 |     )' .test-output.log | head -9 || tail -10 .test-output.log)"
+          printf '%s\n' "$lines" | while IFS= read -r line; do
             [ -n "$line" ] && echo "::error::$line"
           done
