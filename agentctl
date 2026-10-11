@@ -903,16 +903,22 @@ function knownAgentNames() {
   return new Set([...KNOWN_AGENT_NAMES, ...Object.keys(AGENT_CONFIG || {})]);
 }
 
+// 路径归一，用于比较「进程命令行里的脚本路径」与「agentctl 自身路径」：统一斜杠、把 `C:/x`
+// 折成 Git Bash 写出的 MSYS 风格 `/c/x`，并忽略大小写。
+function normScriptPath(p) {
+  return String(p || '')
+    .replace(/\\/g, '/')
+    .replace(/^([a-zA-Z]):\//, (_, d) => `/${d.toLowerCase()}/`)
+    .toLowerCase();
+}
+
 // 返回命中的 { name, pid, cmd }，未命中返回 null；collect 非空时按「自 → 祖先」收集链路
 // （whoami 与失败诊断用它展示识别依据）。
 function detectAgentFromProcessChain(collect) {
   const known = knownAgentNames();
   const isWin = process.platform === 'win32';
-  // Windows：一次取全表快照，再在内存里沿父链走。逐层 `Get-CimInstance -Filter ProcessId=N`
-  // 会在两次查询之间留出竞态——中间某层退出后 pid 被复用，读到的就是无关进程的命令行。
-  // 实测（GitHub windows-latest）：逐层查询把 agentctl 自己带 `--agent <项目声明的名字>` 的
-  // 命令行算成祖先进程，于是 `task create` 把「显式指定 agent」误判成「在 agent 会话内」，
-  // 而同一进程里的 `whoami` 又报未识别——同一环境两次调用结果不同，正是竞态的特征。
+  // Windows：一次取全表快照，再在内存里沿父链走——每层一次 `Get-CimInstance -Filter ProcessId=N`
+  // 要启动 15 次 powershell，取一次总表既快也不会在中途读到已退出进程的空结果。
   let winMap = null;
   const readInfo = (pid) => {
     if (!isWin) {
@@ -937,6 +943,16 @@ function detectAgentFromProcessChain(collect) {
     const info = winMap.get(pid);
     return info ? `${info.ppid} ${info.cmd || ''}` : '';
   };
+  // 运行 agentctl 自身的进程不是「祖先 CLI」：Windows 上 `#!/usr/bin/env node` 留下的
+  // `env.exe` 会 spawn node 并留在进程链上（POSIX 的 exec 在那里没有等价物），而它的命令行
+  // 就是 agentctl 的调用参数——不排除掉，`--agent <项目声明的名字>` 会被当成本会话的 agent
+  // （windows-latest 实测：task create 自认「在 probeagent 会话内」，同一进程的 whoami 却报未识别）。
+  const scriptForms = new Set([__filename, process.argv[1]].map(normScriptPath).filter(Boolean));
+  const runsAgentctlItself = (cmdline) =>
+    cmdline.split(/\s+/).some((tok) => {
+      const t = tok.replace(/^["']+|["']+$/g, '');
+      return t && scriptForms.has(normScriptPath(t));
+    });
   let pid = process.pid;
   const self = pid;
   for (let depth = 0; depth < 15; depth++) {
@@ -949,7 +965,7 @@ function detectAgentFromProcessChain(collect) {
     if (collect) collect.push({ pid, cmd: m[2].slice(0, 200), self: pid === self });
     // 从父进程起匹配：agentctl 自身的命令行参数（如 --agent omp / --agent <项目声明的名字>）
     // 不是「当前会话」的证据，把自己算进去会把每个显式指定 agent 的调用都误判为 agent 会话
-    if (pid !== self) {
+    if (pid !== self && !runsAgentctlItself(m[2])) {
       for (const token of m[2].split(/\s+/)) {
         const base = path.basename(token).replace(/\.(js|cjs|mjs)$/i, '');
         // 变体归一：zcode-cli / zcode-server 之类派生进程名都归属 zcode

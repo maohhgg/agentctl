@@ -550,9 +550,11 @@ run agent list
 assert_out_contains 'agent list 显示检测结果' 'opencode'
 
 # agent 会话内不嵌套启动 CLI（脱离本会话、产出无人验收）：降级为「派子代理」指引，--force 才嵌套启动
+# 探针用 node 而不是 true：Git Bash 的 `true` 是 shell 内置命令，usr/bin 下不一定有 true.exe，
+# Windows 上 whichCommand 找不到它，会话外分支就不会打印 `task start <id>` 那行。
 cat >"$REPO/.agents/config/agents.json" <<'JSON'
 {
-  "probeagent": { "command": "true", "args": [] }
+  "probeagent": { "command": "node", "args": ["-e", ""] }
 }
 JSON
 run task create --platform backend --agent probeagent --task task-session --title 'Session Task' --allowed-paths 'apps/api/src/session/**'
@@ -560,6 +562,17 @@ assert_rc '建任务（探针 agent）成功' 0
 # 本套件若在 agent 会话内运行，会话外分支不可达：条件断言而不是误报
 if "$AGENTCTL" whoami | grep -q '（未识别出已知 agent CLI）'; then
   assert_out_contains '会话外仍以 task start 为首选' 'task start task-session'
+  # 命令行含 agentctl 自身参数的包装进程不算祖先 CLI：Windows 上 `#!/usr/bin/env node` 留下的
+  # env.exe 会 spawn node 并留在链上（POSIX 的 exec 在那里没有等价物），它的命令行就是 agentctl
+  # 的调用参数——不排除就会把 `--agent <项目声明的名字>` 当成本会话的 agent（windows-latest 实测）。
+  # POSIX 上要复现该情形，需要一层会留在链上的包装进程（`sh -c` 不 exec 自己）。
+  sh -c '"$0" "$@"' "$AGENTCTL" task create --platform backend --agent probeagent --task task-wrapper --title 'Wrapper Task' --allowed-paths 'apps/api/src/wrapper/**' >"$WORK/create-wrapper.out" 2>&1
+  if grep -q 'task start task-wrapper' "$WORK/create-wrapper.out"; then
+    pass '包装进程（命令行含 agentctl 自身参数）不算祖先 CLI'
+  else
+    fail '包装进程（命令行含 agentctl 自身参数）不算祖先 CLI' "$(head -3 "$WORK/create-wrapper.out")"
+  fi
+  run task remove task-wrapper --force
 else
   printf 'skip 会话外首选断言：当前处于 agent 会话内\n'
 fi
@@ -578,13 +591,13 @@ if grep -q '会话内' "$WORK/start-session.out" && grep -q '子代理' "$WORK/s
 else
   fail 'agent 会话内 task start 降级为派子代理指引' "$(cat "$WORK/start-session.out")"
 fi
-if grep -q '启动 Worker：true' "$WORK/start-session.out"; then
+if grep -q '启动 Worker：node' "$WORK/start-session.out"; then
   fail '降级路径不启动 CLI' ''
 else
   pass '降级路径不启动 CLI'
 fi
 AGENTCTL_AGENT=omp "$AGENTCTL" task start task-session --force >"$WORK/start-force.out" 2>&1
-grep -q '启动 Worker：true' "$WORK/start-force.out" &&
+grep -q '启动 Worker：node' "$WORK/start-force.out" &&
   pass '--force 才真的嵌套启动' || fail '--force 才真的嵌套启动' "$(cat "$WORK/start-force.out")"
 rm -f "$REPO/.agents/config/agents.json"
 run task remove task-session --force
@@ -1041,7 +1054,7 @@ assert_out_json 'finish --json 失败结果仍是合法 JSON'
 assert_out_contains 'finish --json 带 failures' '"failures"'
 cat >"$REPO/.agents/config/agents.json" <<'JSON'
 {
-  "probeagent": { "command": "true", "args": [] }
+  "probeagent": { "command": "node", "args": ["-e", ""] }
 }
 JSON
 run task create --platform backend --agent probeagent --task task-probe --title 'Probe Task' --allowed-paths 'apps/api/src/probe/**'

@@ -130,17 +130,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `windows-latest` failed that one assertion while Linux and macOS passed. The
   checks now count code points through node, the same `Array.from` unit
   `clipSubject` clips in.
-- **Agent self-identification walks one process snapshot on Windows.** The
-  Windows path ran `Get-CimInstance -Filter ProcessId=N` once per ancestor,
-  which leaves a race: if a level exited between two queries its pid can be
-  reused, and the command line read back belongs to an unrelated process. On
-  `windows-latest` that made the chain scan read agentctl's own
-  `--agent <name>` argument as an ancestor, so `task create` reported
-  "inside an agent session" for an explicitly named agent while `whoami`, run
-  in the same process, reported no match. Windows now takes a single
-  `Win32_Process` snapshot and walks it in memory. `whoami` — and the
-  session-detection notices in `task create` / `task start` — also print the
-  matched pid and command line, so a misidentification names its own evidence.
+- **Agent self-identification no longer counts agentctl's own wrapper as an
+  ancestor CLI.** On Windows the `#!/usr/bin/env node` shebang leaves `env.exe`
+  in the process chain (POSIX `exec` has no equivalent there), and that process's
+  command line *is* agentctl's own invocation — `--agent <name>` included. The
+  chain scan read that argument as an ancestor and reported "inside an agent
+  session", so `task create --agent probeagent …` recommended dispatching a
+  subagent while `whoami`, running the same code in the same process, reported no
+  match. Processes whose command line runs agentctl itself are now skipped.
+  Windows also walks a single `Win32_Process` snapshot instead of running one
+  `Get-CimInstance` query per ancestor. `whoami` — and the session notices in
+  `task create` / `task start` — print the matched pid and command line, so a
+  misidentification names its own evidence.
+- **The suite's probe agent uses `node`, not `true`.** Git Bash's `true` is a
+  shell builtin and `usr/bin` need not ship `true.exe`, so `whichCommand` found
+  nothing on `windows-latest` and the create output omitted the `task start <id>`
+  line the assertion was looking for.
 
 ## [0.0.3] - 2026-09-19
 
