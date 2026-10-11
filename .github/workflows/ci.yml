@@ -24,6 +24,18 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - name: Toolchain versions
-        run: node --version && git --version
+        # locale 决定 bash 的 ${#s} 计数口径（Git Bash 默认 C locale 按字节），出问题要看得见
+        run: node --version && git --version && locale | head -3
       - name: End-to-end tests
-        run: bash tests/agent/agentctl-test.sh
+        run: |
+          set -o pipefail
+          bash tests/agent/agentctl-test.sh 2>&1 | tee .test-output.log
+      - name: Surface failures as annotations
+        # job 日志在网页上要求登录才能读；annotation 走公开 API（check-runs）即可读，
+        # 让无法本地复现的平台（如 Windows）失败时不用登录也能看到具体是哪条断言。
+        if: failure()
+        run: |
+          lines="$(grep -E '^(FAIL|通过 )' .test-output.log || tail -10 .test-output.log)"
+          printf '%s\n' "$lines" | head -10 | while IFS= read -r line; do
+            [ -n "$line" ] && echo "::error::$line"
+          done

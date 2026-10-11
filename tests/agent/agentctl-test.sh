@@ -105,6 +105,13 @@ json_get() {
   ' "$1" "$2"
 }
 
+# 码点数：agentctl 的主题行截断按 Array.from 码点（不切碎多字节字符），但 bash 的
+# ${#s} 按当前 locale 计数——Git Bash(Windows) 默认 C locale 会把中文按字节算（每字 3），
+# 断言在 Windows 上假失败。统一用 node 计码点，与实现同口径。
+code_points() {
+  node -e 'process.stdout.write(String(Array.from(process.argv[1]).length))' "$1"
+}
+
 section() { printf '\n== %s ==\n' "$1"; }
 
 # ============================ 夹具 ============================
@@ -344,9 +351,9 @@ MERGE_BODY_LINES="$(g log -1 --format=%b main | grep -c . || true)"
 [[ "$MERGE_BODY_LINES" == 0 ]] &&
   pass '合并提交正文为空（不带 Task/分支/带入提交清单）' ||
   fail '合并提交正文为空（不带 Task/分支/带入提交清单）' "正文非空行数=$MERGE_BODY_LINES｜$(g log -1 --format=%b main)"
-[[ "${#MERGE_SUBJECT}" -le 72 ]] &&
+[[ "$(code_points "$MERGE_SUBJECT")" -le 72 ]] &&
   pass '合并提交主题行不超过 72 字符' ||
-  fail '合并提交主题行不超过 72 字符' "长度=${#MERGE_SUBJECT}"
+  fail '合并提交主题行不超过 72 字符' "码点数=$(code_points "$MERGE_SUBJECT")｜$MERGE_SUBJECT"
 
 # 边界：任务标题超长时，主题行必须自己截断守住 commit-msg 的 ≤72 字符规则，
 # 否则 agentctl 生成的提交会顶破项目自己的提交信息约束。
@@ -365,9 +372,9 @@ run task integrate task-longtitle
 assert_rc '超长标题任务 integrate' 0
 LONG_SUBJECT="$(g log -1 --format=%s main)"
 LONG_BODY_LINES="$(g log -1 --format=%b main | grep -c . || true)"
-[[ "${#LONG_SUBJECT}" -le 72 ]] &&
+[[ "$(code_points "$LONG_SUBJECT")" -le 72 ]] &&
   pass '超长标题的合并主题行仍 ≤72 字符' ||
-  fail '超长标题的合并主题行仍 ≤72 字符' "长度=${#LONG_SUBJECT}：$LONG_SUBJECT"
+  fail '超长标题的合并主题行仍 ≤72 字符' "码点数=$(code_points "$LONG_SUBJECT")：$LONG_SUBJECT"
 [[ "$LONG_SUBJECT" == 'chore(merge): 合并 api · '*'…' ]] &&
   pass '超长标题按 72 字符截断并以省略号收尾' ||
   fail '超长标题按 72 字符截断并以省略号收尾' "实际：$LONG_SUBJECT"
