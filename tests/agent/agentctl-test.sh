@@ -68,8 +68,10 @@ run() {
 
 assert_rc() { if [[ "$RC" == "$2" ]]; then pass "$1"; else fail "$1" "退出码 期望=$2 实际=$RC｜stderr: $ERR"; fi; }
 assert_rc_nonzero() { if [[ "$RC" != 0 ]]; then pass "$1"; else fail "$1" '退出码应为非 0'; fi; }
-assert_out_contains() { if [[ "$OUT" == *"$2"* ]]; then pass "$1"; else fail "$1" "stdout 未包含：$2"; fi; }
-assert_err_contains() { if [[ "$ERR" == *"$2"* ]]; then pass "$1"; else fail "$1" "stderr 未包含：$2"; fi; }
+# 失败详情带实际输出（截断 12 行）：CI 的 job 日志要登录才能看，annotation 只带 FAIL 行，
+# 不带上实际输出就无法在本地复现不了的环境（Windows）上定位差异。
+assert_out_contains() { if [[ "$OUT" == *"$2"* ]]; then pass "$1"; else fail "$1" "stdout 未包含：$2｜实际：$(printf '%s' "$OUT" | head -12)"; fi; }
+assert_err_contains() { if [[ "$ERR" == *"$2"* ]]; then pass "$1"; else fail "$1" "stderr 未包含：$2｜实际：$(printf '%s' "$ERR" | head -12)"; fi; }
 
 # stdout 必须是可被 JSON.parse 的单一结果（--json 的契约）
 assert_out_json() {

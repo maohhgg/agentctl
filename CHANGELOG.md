@@ -85,6 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit-msg rule enforces. The subject is now clipped to 72 characters
   (counted in code points, never mid-character), with the prefix
   `chore(merge): 合并 <平台> · ` taking its share of the budget first.
+- **CI prints failing assertions as annotations.** Job logs are only readable
+  from a signed-in browser, so the workflow tees the suite output and re-emits
+  the `FAIL` lines plus the pass/fail tally as `::error::` annotations, which
+  are readable through the public check-runs API. It also prints `locale` in the
+  toolchain step — the only way to see why a platform you cannot run locally
+  (Windows) went red.
 
 ### Fixed
 
@@ -116,6 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agentctl task create --agent omp …` (or any name declared in
   `.agents/config/agents.json`) matched its own `--agent` argument and reported
   "inside an omp session". The scan now starts at the parent process.
+- **The suite's subject-length checks no longer depend on the shell's locale.**
+  They counted characters with bash's `${#s}`, which counts *bytes* under the
+  `C` locale Git Bash uses by default — a subject containing CJK text (every
+  `chore(merge): 合并 …` subject) looked three times longer than it is, so
+  `windows-latest` failed that one assertion while Linux and macOS passed. The
+  checks now count code points through node, the same `Array.from` unit
+  `clipSubject` clips in.
 
 ## [0.0.3] - 2026-09-19
 
