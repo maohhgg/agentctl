@@ -210,7 +210,7 @@ agentctl [-C <dir>] [--json] <command> [args]
 | Command | Purpose |
 |---|---|
 | `init` | One-time setup: add the `.gitignore` exclusions (idempotent, never overwrites); platform ranges are declared by hand in `platforms.json` |
-| `whoami` | Show which agent name would be self-identified in this session |
+| `whoami` | Show the self-identified agent name plus the process chain it came from (when nothing matched, the chain shows what was inspected) |
 | `doctor` | Self-check: git, repo, worktrees, registry, agent CLIs (+ version drift vs the tested template), platform config keys, mode |
 | `agent list` | Agent runners and whether they're detected on PATH |
 | `platform list` | Declared platform ranges, state and aliases (warns about config keys that don't take effect) |

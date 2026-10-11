@@ -189,7 +189,7 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 | 命令 | 说明 |
 |---|---|
 | `init` | 一次性初始化：补 `.gitignore` 排除项（幂等，绝不覆盖）；平台范围由 `platforms.json` 人工声明 |
-| `whoami` | 查看当前会话的 agent 自识别结果 |
+| `whoami` | 查看 agent 自识别结果与命中的进程链（未命中时展示被检查的链路，便于判断误判） |
 | `doctor` | 自检：git / 仓库 / worktree / 注册表 / agent CLI（含与模板实测版本的漂移）/ 平台配置键 / 当前模式 |
 | `agent list` | Agent runner 与本机检测结果 |
 | `platform list` | 已声明的平台范围、状态与别名（不生效的配置键会告警） |

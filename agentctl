@@ -903,29 +903,50 @@ function knownAgentNames() {
   return new Set([...KNOWN_AGENT_NAMES, ...Object.keys(AGENT_CONFIG || {})]);
 }
 
-function detectAgentFromProcessChain() {
+// 返回命中的 { name, pid, cmd }，未命中返回 null；collect 非空时按「自 → 祖先」收集链路
+// （whoami 与失败诊断用它展示识别依据）。
+function detectAgentFromProcessChain(collect) {
   const known = knownAgentNames();
   const isWin = process.platform === 'win32';
+  // Windows：一次取全表快照，再在内存里沿父链走。逐层 `Get-CimInstance -Filter ProcessId=N`
+  // 会在两次查询之间留出竞态——中间某层退出后 pid 被复用，读到的就是无关进程的命令行。
+  // 实测（GitHub windows-latest）：逐层查询把 agentctl 自己带 `--agent <项目声明的名字>` 的
+  // 命令行算成祖先进程，于是 `task create` 把「显式指定 agent」误判成「在 agent 会话内」，
+  // 而同一进程里的 `whoami` 又报未识别——同一环境两次调用结果不同，正是竞态的特征。
+  let winMap = null;
   const readInfo = (pid) => {
     if (!isWin) {
       const r = spawnSync('ps', ['-o', 'ppid=,args=', '-p', String(pid)], { encoding: 'utf8' });
       return r.status === 0 ? r.stdout.replace(/\r/g, '').replace(/\n+$/, '') : '';
     }
-    // Windows：PowerShell CIM 查询 PPID 与 CommandLine（ps 不存在）
-    const script = `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object -First 1; if ($p) { "$($p.ParentProcessId) $($p.CommandLine)" }`;
-    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
-    if (r.status !== 0 || !r.stdout.trim()) return '';
-    return r.stdout.replace(/\r/g, '').replace(/\n+$/, '');
+    if (!winMap) {
+      const r = spawnSync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command',
+          'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId) $($_.CommandLine)" }'],
+        { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
+      );
+      if (r.status !== 0 || !r.stdout) return '';
+      winMap = new Map();
+      for (const raw of r.stdout.replace(/\r/g, '').split('\n')) {
+        const m = raw.match(/^\s*(\d+)\s+(\d+)\s*(.*)$/);
+        if (m) winMap.set(Number(m[1]), { ppid: Number(m[2]), cmd: m[3] });
+      }
+      if (winMap.size === 0) return '';
+    }
+    const info = winMap.get(pid);
+    return info ? `${info.ppid} ${info.cmd || ''}` : '';
   };
   let pid = process.pid;
   const self = pid;
   for (let depth = 0; depth < 15; depth++) {
-    if (pid <= 1) return '';
+    if (pid <= 1) return null;
     const line = readInfo(pid);
-    if (!line) return '';
+    if (!line) return null;
     const m = line.match(/^\s*(\d+)\s+(.*)$/);
-    if (!m) return '';
+    if (!m) return null;
     const parent = Number.parseInt(m[1], 10);
+    if (collect) collect.push({ pid, cmd: m[2].slice(0, 200), self: pid === self });
     // 从父进程起匹配：agentctl 自身的命令行参数（如 --agent omp / --agent <项目声明的名字>）
     // 不是「当前会话」的证据，把自己算进去会把每个显式指定 agent 的调用都误判为 agent 会话
     if (pid !== self) {
@@ -933,13 +954,15 @@ function detectAgentFromProcessChain() {
         const base = path.basename(token).replace(/\.(js|cjs|mjs)$/i, '');
         // 变体归一：zcode-cli / zcode-server 之类派生进程名都归属 zcode
         for (const name of known) {
-          if (base === name || base.startsWith(`${name}-`)) return name;
+          if (base === name || base.startsWith(`${name}-`)) {
+            return { name, pid, cmd: m[2].slice(0, 200) };
+          }
         }
       }
     }
     pid = parent;
   }
-  return '';
+  return null;
 }
 
 // --agent 缺省时的解析：flag > AGENTCTL_AGENT 环境变量 > 进程链。返回 { agent, source } 或 null。
@@ -948,7 +971,7 @@ function resolveAgentName(explicit) {
   const fromEnv = (process.env.AGENTCTL_AGENT || '').trim();
   if (fromEnv) return { agent: fromEnv, source: 'env' };
   const fromProcess = detectAgentFromProcessChain();
-  if (fromProcess) return { agent: fromProcess, source: 'process' };
+  if (fromProcess) return { agent: fromProcess.name, source: 'process', evidence: { pid: fromProcess.pid, cmd: fromProcess.cmd } };
   return null;
 }
 
@@ -963,15 +986,30 @@ function currentAgentSession() {
 
 function cmdWhoami(argv) {
   parseFlags(argv);
-  const resolved = resolveAgentName('');
+  const chain = [];
+  const proc = detectAgentFromProcessChain(chain);
+  const envName = (process.env.AGENTCTL_AGENT || '').trim();
+  const resolved = envName
+    ? { agent: envName, source: 'env' }
+    : proc
+      ? { agent: proc.name, source: 'process', evidence: { pid: proc.pid, cmd: proc.cmd } }
+      : null;
   if (JSON_OUT) {
-    note(JSON.stringify({ env: resolved?.source === 'env' ? resolved.agent : null, process: resolved?.source === 'process' ? resolved.agent : null, effective: resolved?.agent ?? null }, null, 2));
+    note(JSON.stringify({
+      env: resolved?.source === 'env' ? resolved.agent : null,
+      process: resolved?.source === 'process' ? resolved.agent : null,
+      effective: resolved?.agent ?? null,
+      evidence: resolved?.evidence ?? null,
+      chain,
+    }, null, 2));
     return;
   }
-  const envName = (process.env.AGENTCTL_AGENT || '').trim();
-  const procName = resolved?.source === 'process' ? resolved.agent : '';
   note(`AGENTCTL_AGENT 环境变量：${envName || '（未设置）'}`);
-  note(`进程链自识别：${procName || '（未识别出已知 agent CLI）'}`);
+  note(`进程链自识别：${proc ? proc.name : '（未识别出已知 agent CLI）'}`);
+  // 命中层与整条链：误判（同一环境两次调用结果不同）时靠它判断命中的是哪一层
+  if (proc) note(`  识别依据：pid=${proc.pid} ${proc.cmd}`);
+  note('进程链（自 → 祖先，最多 8 层）：');
+  for (const c of chain.slice(0, 8)) note(`  ${c.self ? '[self] ' : ''}pid=${c.pid} ${c.cmd || '（无命令行）'}`);
   note(`生效值（task create --agent 缺省时）：${resolved ? `${resolved.agent}（${AGENT_SOURCE_LABELS[resolved.source]}）` : '（无 → 建任务需显式传 --agent）'}`);
   note('');
   note('已知名字集：内置 runner ∪ .agents/config/agents.json 声明 ∪ 常见 agent CLI 名；不确定时显式传 --agent。');
@@ -1497,6 +1535,7 @@ function cmdTaskCreate(argv) {
   note('Start Worker:');
   if (session) {
     note(`  当前在 ${session.agent} 会话内（${AGENT_SOURCE_LABELS[session.source]}）：派子代理进任务 worktree 开发，不要在本会话内嵌套启动 CLI`);
+    if (session.evidence) note(`    识别依据：pid=${session.evidence.pid} ${session.evidence.cmd}`);
     note(`    工作目录：${task.worktree}`);
     note(`    权威入口：${contextFile}`);
     note('');
@@ -1564,8 +1603,9 @@ function startWorker(task, runner, { force = false } = {}) {
   }
   const session = force ? null : currentAgentSession();
   if (session) {
-    if (JSON_OUT) return notStarted('agent-session', { session_agent: session.agent, session_source: session.source, force_available: true });
+    if (JSON_OUT) return notStarted('agent-session', { session_agent: session.agent, session_source: session.source, session_evidence: session.evidence ?? null, force_available: true });
     note(`当前在 ${session.agent} 会话内（${AGENT_SOURCE_LABELS[session.source]}）：不在本会话内嵌套启动 ${task.agent} CLI。`);
+    if (session.evidence) note(`识别依据：pid=${session.evidence.pid} ${session.evidence.cmd}`);
     note('');
     note('嵌套启动的 CLI 脱离本会话——本会话收不到它的中间状态与结果，超时被杀还会留下零提交的僵尸任务。');
     note('');
