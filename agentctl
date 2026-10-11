@@ -25,7 +25,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawnSync, spawn } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 
 const VERSION = '0.0.3';
 
@@ -48,6 +48,12 @@ const SELF = (() => {
 
 function note(msg = '') {
   process.stdout.write(`${msg}\n`);
+}
+
+// 人类可读的步骤进度：--json 模式下改写到 stderr，保证 stdout 只有一份机器可读结果
+function progress(msg = '') {
+  if (JSON_OUT) process.stderr.write(`${msg}\n`);
+  else note(msg);
 }
 
 function warn(msg) {
@@ -132,6 +138,10 @@ const BRANCH_TYPES = ['feat', 'fix', 'docs', 'refactor', 'perf', 'test',
                       'build', 'ci', 'chore', 'style', 'revert'];
 let CONFIG = {}; // .agents/config/platforms.json
 let AGENT_CONFIG = {}; // .agents/config/agents.json
+// 平台配置的可用键：其余键一律不生效（在 doctor / platform list 里告警，不静默忽略）
+const CONFIG_TOP_KEYS = ['main_branch', 'worktree_root', 'platforms'];
+const CONFIG_PLATFORM_KEYS = ['paths', 'aliases', 'test_command', 'test_command_global', 'test_globs', 'test_timeout'];
+let CONFIG_WARNINGS = [];
 let PLATFORMS_CACHE = null; // 单次调用内缓存平台表（一条命令内不会改写平台配置）
 let WORKTREE_ROOT_INSIDE = false; // worktree_root 落在仓库主 checkout 内部时为 true（告警用）
 
@@ -193,17 +203,31 @@ function configInit() {
   MAIN_BRANCH = typeof CONFIG.main_branch === 'string' && CONFIG.main_branch ? CONFIG.main_branch : 'main';
   WORKTREE_ROOT = normalizePath(wr);
   WORKTREE_ROOT_INSIDE = isUnder(WORKTREE_ROOT, ROOT);
+  CONFIG_WARNINGS = configKeyWarnings();
+}
+
+// 配置里写了但不生效的键：静默忽略会让「以为改过了」长期误解下去
+function configKeyWarnings() {
+  const out = [];
+  for (const k of Object.keys(CONFIG)) {
+    if (!CONFIG_TOP_KEYS.includes(k)) out.push(`平台配置顶层键 ${k} 不生效（可用键：${CONFIG_TOP_KEYS.join(' / ')}）`);
+  }
+  const declared = CONFIG.platforms && typeof CONFIG.platforms === 'object' ? CONFIG.platforms : {};
+  for (const [id, raw] of Object.entries(declared)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    for (const k of Object.keys(raw)) {
+      if (CONFIG_PLATFORM_KEYS.includes(k)) continue;
+      const extra = k === 'branch' ? '（单主线模型下所有平台的集成分支统一用 main_branch）' : '';
+      out.push(`平台 ${id} 的键 ${k} 不生效${extra}（可用键：${CONFIG_PLATFORM_KEYS.join(' / ')}）`);
+    }
+  }
+  return out;
 }
 
 // ============================ 平台注册表 ============================
 // 平台 = 一段目录范围（monorepo 下没有平台分支，也没有平台 worktree）。
 // 来源：.agents/config/platforms.json 声明 id、别名与 paths；
 // 声明的目录不存在即报缺失，不静默改写。所有平台的集成分支统一是 main。
-
-function detectPlatforms() {
-  // monorepo 单主线：平台不再由 worktree 探测，全部来自配置声明
-  return [];
-}
 
 function isUnder(p, dir) {
   const a = toPosix(p);
@@ -332,26 +356,75 @@ function registryLockPath() {
   return path.join(STATE_DIR, 'locks', 'registry.lock');
 }
 
+// 本进程当前持有的锁（同一进程一次只可能持有一把：注册表只有一个临界区）
+let HELD_LOCK = null;
+
+function readLockOwner(lockPath) {
+  try {
+    const raw = fs.readFileSync(path.join(lockPath, 'owner'), 'utf8');
+    const pid = raw.match(/pid=(\d+)/);
+    const token = raw.match(/token=(\S+)/);
+    return { pid: pid ? Number.parseInt(pid[1], 10) : 0, token: token ? token[1] : '' };
+  } catch {
+    return null;
+  }
+}
+
+// signal 0 只做存在性/权限检查：EPERM 说明进程在，只是无权限发信号 → 视为存活
+function processAlive(pid) {
+  if (!pid || pid === process.pid) return pid === process.pid;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+// 释放只删「自己那把」锁：锁可能已被判为残留而由别人抢走，删错会把并发写者放进临界区
+function releaseHeldLock() {
+  const held = HELD_LOCK;
+  HELD_LOCK = null;
+  if (!held) return;
+  const owner = readLockOwner(held.path);
+  if (owner && owner.token && owner.token !== held.token) return;
+  try {
+    fs.rmSync(held.path, { recursive: true, force: true });
+  } catch {
+    /* 锁释放失败不影响主流程 */
+  }
+}
+
+// process.exit() 不展开调用栈（一旦 die 就不会走 finally），但会触发 exit 事件——
+// 把释放挂在 exit 上，任何 die / 正常退出都不会留下残留锁把后续命令永久卡住。
+process.on('exit', releaseHeldLock);
+
 function withRegistryLock(fn, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 15000;
-  const staleMs = opts.staleMs ?? 120000;
+  const freshMs = opts.freshMs ?? 2000; // 刚建的锁不抢：创建者可能还没写完 owner
   const lockPath = registryLockPath();
+  const token = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   const started = Date.now();
   for (;;) {
     try {
       fs.mkdirSync(lockPath); // mkdir 是原子操作
-      fs.writeFileSync(path.join(lockPath, 'owner'), `pid=${process.pid}\nat=${new Date().toISOString()}\n`);
+      fs.writeFileSync(path.join(lockPath, 'owner'), `pid=${process.pid}\ntoken=${token}\nat=${new Date().toISOString()}\n`);
+      HELD_LOCK = { path: lockPath, token };
       break;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      let stale = false;
+      let age = Infinity;
       try {
-        stale = Date.now() - fs.statSync(lockPath).mtimeMs > staleMs;
+        age = Date.now() - fs.statSync(lockPath).mtimeMs;
       } catch {
-        stale = true;
+        age = Infinity; // stat 失败（持有者刚释放）→ 下一轮直接重试
       }
-      if (stale) {
+      const owner = readLockOwner(lockPath);
+      const ownerAlive = owner && owner.pid ? processAlive(owner.pid) : false;
+      // 只抢「持有者已死」的残留锁（进程被 kill -9 / 超时被杀都会留下它，必须能自愈）；
+      // 活锁一律等到超时，绝不切开并发写者的临界区
+      if (!ownerAlive && age > freshMs) {
         try {
           fs.rmSync(lockPath, { recursive: true, force: true });
         } catch {
@@ -360,7 +433,10 @@ function withRegistryLock(fn, opts = {}) {
         continue;
       }
       if (Date.now() - started > timeoutMs) {
-        die(`任务注册表被其他进程锁定：${lockPath}\n等待 ${Math.round(timeoutMs / 1000)}s 未释放；确认无残留进程后删除该目录重试`);
+        const who = owner && owner.pid
+          ? `pid=${owner.pid}（${ownerAlive ? '进程仍存活' : '进程已退出'}）`
+          : 'owner 未知（锁目录里没有 owner 文件）';
+        die(`任务注册表被其他进程锁定：${lockPath}\n持有者：${who}；等待 ${Math.round(timeoutMs / 1000)}s 未释放。\n持有进程已不存在时，该锁会在下一次调用时自动回收；仍无法进展再手工删除该目录。`);
       }
       sleepMs(50);
     }
@@ -368,11 +444,7 @@ function withRegistryLock(fn, opts = {}) {
   try {
     return fn();
   } finally {
-    try {
-      fs.rmSync(lockPath, { recursive: true, force: true });
-    } catch {
-      /* 锁释放失败不影响主流程 */
-    }
+    releaseHeldLock();
   }
 }
 
@@ -622,6 +694,18 @@ function collectChanges(wt, baseCommit) {
   return [...set];
 }
 
+// git 索引标记审计：skip-worktree / assume-unchanged 会让文件对 status / diff 隐形，
+// 于是 worktree 里真实的未提交改动审计不到（越界改动会被 check / finish 误判为干净）。
+// 标记本身只可能是人工/脚本设置，正常开发不会出现——出现了就是审计链断了。
+function indexManipulation(wt) {
+  const r = git(['-C', wt, '-c', 'core.quotePath=false', 'ls-files', '-v']);
+  if (r.status !== 0) return [];
+  return lines(r.stdout)
+    .filter((l) => /^(S|[a-z])\s/.test(l)) // S = skip-worktree；小写标签 = assume-unchanged
+    .map((l) => l.replace(/^\S+\s+/, '').trim())
+    .filter(Boolean);
+}
+
 function globToRegExp(pattern) {
   let re = '';
   for (let i = 0; i < pattern.length; i++) {
@@ -834,20 +918,26 @@ function detectAgentFromProcessChain() {
     return r.stdout.replace(/\r/g, '').replace(/\n+$/, '');
   };
   let pid = process.pid;
+  const self = pid;
   for (let depth = 0; depth < 15; depth++) {
     if (pid <= 1) return '';
     const line = readInfo(pid);
     if (!line) return '';
     const m = line.match(/^\s*(\d+)\s+(.*)$/);
     if (!m) return '';
-    pid = Number.parseInt(m[1], 10);
-    for (const token of m[2].split(/\s+/)) {
-      const base = path.basename(token).replace(/\.(js|cjs|mjs)$/i, '');
-      // 变体归一：zcode-cli / zcode-server 之类派生进程名都归属 zcode
-      for (const name of known) {
-        if (base === name || base.startsWith(`${name}-`)) return name;
+    const parent = Number.parseInt(m[1], 10);
+    // 从父进程起匹配：agentctl 自身的命令行参数（如 --agent omp / --agent <项目声明的名字>）
+    // 不是「当前会话」的证据，把自己算进去会把每个显式指定 agent 的调用都误判为 agent 会话
+    if (pid !== self) {
+      for (const token of m[2].split(/\s+/)) {
+        const base = path.basename(token).replace(/\.(js|cjs|mjs)$/i, '');
+        // 变体归一：zcode-cli / zcode-server 之类派生进程名都归属 zcode
+        for (const name of known) {
+          if (base === name || base.startsWith(`${name}-`)) return name;
+        }
       }
     }
+    pid = parent;
   }
   return '';
 }
@@ -863,6 +953,13 @@ function resolveAgentName(explicit) {
 }
 
 const AGENT_SOURCE_LABELS = { flag: '显式 --agent', env: 'AGENTCTL_AGENT 环境变量', process: '进程链自识别' };
+
+// 当前是否处于 agent CLI 会话内（AGENTCTL_AGENT 声明或进程链自识别）。
+// 用于避免「agent 会话里再嵌套启动 CLI」：那种 Worker 脱离本会话——本会话收不到
+// 它的中间状态与结果，超时被杀还会留下零提交的僵尸任务；正规路径是由本会话派子代理。
+function currentAgentSession() {
+  return resolveAgentName('');
+}
 
 function cmdWhoami(argv) {
   parseFlags(argv);
@@ -889,14 +986,17 @@ const BUILTIN_RUNNERS = {
   omp: {
     name: 'omp',
     command: 'omp',
-    note: 'omp v18.2.5 实测：--cwd=<dir> 指定工作目录，-p/--print 非交互处理 prompt 后退出，--auto-approve 跳过工具批准（非交互自动化必需）',
+    // tested = 模板参数实测通过的版本；doctor 与本机 --version 比对，不一致时提示复核
+    tested: '18.8.9',
+    note: 'omp v18.8.9 实测：--cwd=<dir> 指定工作目录，-p/--print 非交互处理 prompt 后退出，--auto-approve 跳过工具批准（非交互自动化必需）',
     build: (ctx) => ({ command: 'omp', args: ['--cwd', ctx.worktree, '-p', '--auto-approve', ctx.prompt] }),
   },
   opencode: {
     name: 'opencode',
     command: 'opencode',
-    note: 'opencode 实测：`opencode run [message..]` 非交互执行，--dir 指定运行目录',
-    build: (ctx) => ({ command: 'opencode', args: ['run', '--dir', ctx.worktree, ctx.prompt] }),
+    tested: '1.18.34',
+    note: 'opencode v1.18.34 实测：`opencode run [message..]` 非交互执行；该版本没有 --dir，工作目录由启动 cwd 决定（agentctl 已把 cwd 设为任务 worktree）',
+    build: (ctx) => ({ command: 'opencode', args: ['run', ctx.prompt] }),
   },
   codex: {
     name: 'codex',
@@ -911,6 +1011,19 @@ const BUILTIN_RUNNERS = {
     build: null,
   },
 };
+
+// 取 CLI 自报版本（只用于提示模板是否漂移；缺失/超时/非零退出一律返回空，不报错）
+function runnerVersion(runner) {
+  const res = spawnSync(runner.path || runner.command, ['--version'], {
+    encoding: 'utf8',
+    timeout: 1500,
+    killSignal: 'SIGKILL',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (res.error || res.status !== 0) return '';
+  const m = `${res.stdout || ''} ${res.stderr || ''}`.match(/\d+\.\d+\.\d+/);
+  return m ? m[0] : '';
+}
 
 function whichCommand(cmd) {
   if (!cmd) return '';
@@ -1000,6 +1113,31 @@ function printTable(headers, rows) {
   for (const r of all) {
     note(r.map((cell, c) => String(cell ?? '').padEnd(widths[c] + 2)).join('').trimEnd());
   }
+}
+
+// 距某个 ISO 时间戳过去的毫秒数（无效/缺失返回 null）
+function ageMs(iso) {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? Math.max(0, Date.now() - t) : null;
+}
+
+function ageSeconds(iso) {
+  const ms = ageMs(iso);
+  return ms === null ? null : Math.round(ms / 1000);
+}
+
+// 人读时长：just now / 12m / 3h20m / 2d4h
+function humanDuration(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 45) return 'just now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h${m % 60 ? `${m % 60}m` : ''}`;
+  const d = Math.floor(h / 24);
+  return `${d}d${h % 24 ? `${h % 24}h` : ''}`;
 }
 
 // ============================ 参数解析 ============================
@@ -1155,6 +1293,7 @@ function cmdPlatformList() {
   note('');
   note('平台 = 目录范围；集成分支统一是 main（merge / test / review / release），agent 开发请在任务 worktree 内进行。');
   note(`仓库枢纽：${ROOT}（${currentBranch(ROOT)}）　任务 worktree 根：${WORKTREE_ROOT}`);
+  for (const w of CONFIG_WARNINGS) warn(w);
 }
 
 // ============================ task create ============================
@@ -1172,7 +1311,7 @@ function warnIfInPlatformWorktree() {
 function cmdTaskCreate(argv) {
   const { vals, flags } = parseFlags(argv, {
     value: ['--platform', '--agent', '--task', '--title', '--objective', '--requirements', '--allowed-paths', '--feature', '--parent', '--test-command', '--test-filter', '--timeout', '--type'],
-    bool: ['--start', '--allow-overlap', '--dry-run'],
+    bool: ['--start', '--force', '--allow-overlap', '--dry-run'],
   });
   const platformName = vals['--platform'];
   const title = vals['--title'];
@@ -1251,7 +1390,6 @@ function cmdTaskCreate(argv) {
       base_commit: baseCommit,
       task_branch: taskBranch,
       worktree: wtPath,
-      worktree_rel: '',
       status: 'active',
       allowed_paths: allowed,
       feature: vals['--feature'] || null,
@@ -1277,7 +1415,6 @@ function cmdTaskCreate(argv) {
     const add = git(['-C', ROOT, 'worktree', 'add', '-b', taskBranch, wtPath, baseCommit]);
     if (add.status !== 0) die(`创建任务 worktree 失败：${wtPath}\n${(add.stderr || '').trim()}`);
     task.worktree = normalizePath(wtPath);
-    task.worktree_rel = relToRoot(task.worktree);
 
     const contextFile = writeTaskContext(task);
     writeTask(task);
@@ -1286,6 +1423,16 @@ function cmdTaskCreate(argv) {
 
   const task = result.task;
   if (!result.created) {
+    const planned = buildRunnerCommand(task);
+    if (JSON_OUT) {
+      note(JSON.stringify({
+        dry_run: true,
+        task,
+        worker_command: planned.ok ? { command: planned.command, args: planned.args } : null,
+        worker_unavailable: planned.ok ? null : planned.reason,
+      }, null, 2));
+      return;
+    }
     note('[dry-run] 将创建（未改动任何文件）：');
     note('');
     note(`Platform:  ${row.id}（${(row.paths || []).map((p) => relToRoot(p)).join(', ')} @ ${row.branch}）`);
@@ -1294,12 +1441,25 @@ function cmdTaskCreate(argv) {
     note(`Worktree:  ${wtPathPreview}`);
     note('');
     note(JSON.stringify(task, null, 2));
-    const planned = buildRunnerCommand(task);
     if (planned.ok) note(`\n[dry-run] Worker 启动命令：${planned.command} ${planned.args.map(shellQuote).join(' ')}`);
     else note(`\n[dry-run] 无法自动启动 Worker：${planned.reason}`);
     return;
   }
   const contextFile = result.contextFile;
+
+  if (flags.has('--start')) {
+    startWorker(task, buildRunnerCommand(task), { force: flags.has('--force') });
+    return;
+  }
+  if (JSON_OUT) {
+    note(JSON.stringify({
+      task,
+      task_context: contextFile,
+      scope_check: `${SELF} task check ${task.id}`,
+      finish: `${SELF} task finish ${task.id}`,
+    }, null, 2));
+    return;
+  }
 
   note('Task created.');
   note('');
@@ -1333,20 +1493,24 @@ function cmdTaskCreate(argv) {
   note(`  ${SELF} task check ${task.id}`);
   note('');
 
-  const runner = buildRunnerCommand(task);
-  if (flags.has('--start')) {
-    startWorker(task, runner);
-    return;
-  }
+  const session = currentAgentSession();
   note('Start Worker:');
-  if (runner.ok) {
-    note(`  ${SELF} task start ${task.id}          # 自动启动 ${task.agent}（${runner.command}）`);
+  if (session) {
+    note(`  当前在 ${session.agent} 会话内（${AGENT_SOURCE_LABELS[session.source]}）：派子代理进任务 worktree 开发，不要在本会话内嵌套启动 CLI`);
+    note(`    工作目录：${task.worktree}`);
+    note(`    权威入口：${contextFile}`);
+    note('');
+  } else {
+    const runner = buildRunnerCommand(task);
+    if (runner.ok) {
+      note(`  ${SELF} task start ${task.id}          # 启动 ${task.agent}（${runner.command}）`);
+    }
+    note('');
+    note(`  cd ${task.worktree}`);
+    note(`  ${task.agent}`);
+    note('');
+    if (!runner.ok) note(`（自动启动降级：${runner.reason}）`);
   }
-  note('');
-  note(`  cd ${task.worktree}`);
-  note(`  ${task.agent}`);
-  note('');
-  if (!runner.ok) note(`（自动启动降级：${runner.reason}）`);
   note(`主干 ${row.branch} 只做 integration / review / release，勿在主 checkout 内直接开发。`);
 }
 
@@ -1356,8 +1520,19 @@ function warnIfInTaskWorktree() {
   if (t) warn(`当前目录是任务 worktree（${t.id}）：如需在该任务内继续开发请直接开工；若要创建新任务，请回到仓库根或使用 -C 指定。`);
 }
 
-function startWorker(task, runner) {
+function startWorker(task, runner, { force = false } = {}) {
+  const base = {
+    task_id: task.id,
+    worktree: task.worktree,
+    task_context: taskContextPath(task.worktree),
+    agent: task.agent,
+  };
+  const notStarted = (reason, extra = {}) => {
+    if (JSON_OUT) note(JSON.stringify({ started: false, reason, ...base, ...extra }, null, 2));
+    return 0;
+  };
   if (!runner.ok) {
+    if (JSON_OUT) return notStarted('runner-unavailable', { detail: runner.reason });
     note('无法自动启动 Worker，已降级为手工启动：');
     note('');
     note(`  cd ${task.worktree}`);
@@ -1367,13 +1542,74 @@ function startWorker(task, runner) {
     return 0;
   }
   if (DRY_RUN) {
+    if (JSON_OUT) {
+      note(JSON.stringify({ dry_run: true, started: false, reason: 'dry-run', command: runner.command, args: runner.args, ...base }, null, 2));
+      return 0;
+    }
     note(`[dry-run] ${runner.command} ${runner.args.map(shellQuote).join(' ')}`);
     return 0;
   }
-  note(`启动 Worker：${runner.command} ${runner.args.map(shellQuote).join(' ')}`);
-  note('');
-  const res = spawnSync(runner.command, runner.args, { cwd: task.worktree, stdio: 'inherit', env: process.env });
+  const batch = windowsBatchRunner(runner);
+  if (batch) {
+    if (JSON_OUT) return notStarted('windows-batch', { path: batch });
+    note(`无法自动启动 Worker：${path.basename(batch)} 是 Windows 批处理包装（.cmd/.bat）。`);
+    note('');
+    note('Node 自 CVE-2024-27980 修复起禁止不带 shell 直接启动批处理（会抛 EINVAL），agentctl 不代拼 shell 引号。');
+    note('');
+    note('两条可行路径：');
+    note(`  1) 本会话前台接手：cd ${task.worktree} && ${task.agent}`);
+    note('  2) 在 .agents/config/agents.json 里声明 cmd.exe 包装（引号与转义由声明方负责），例如：');
+    note(`     "${runner.name}": { "command": "cmd.exe", "args": ["/d", "/s", "/c", "${path.basename(batch)}", "{prompt}"] }`);
+    return 0;
+  }
+  const session = force ? null : currentAgentSession();
+  if (session) {
+    if (JSON_OUT) return notStarted('agent-session', { session_agent: session.agent, session_source: session.source, force_available: true });
+    note(`当前在 ${session.agent} 会话内（${AGENT_SOURCE_LABELS[session.source]}）：不在本会话内嵌套启动 ${task.agent} CLI。`);
+    note('');
+    note('嵌套启动的 CLI 脱离本会话——本会话收不到它的中间状态与结果，超时被杀还会留下零提交的僵尸任务。');
+    note('');
+    note('改用：由本会话派子代理进任务 worktree 开发（子代理只实现 + 自测留证，不提交）');
+    note(`  工作目录：${task.worktree}`);
+    note(`  权威入口：${taskContextPath(task.worktree)}`);
+    note('');
+    note('确要本会话前台接手（同步等待 CLI 退出）：');
+    note(`  cd ${task.worktree}`);
+    note(`  ${task.agent}`);
+    note('');
+    note(`确要嵌套启动：${SELF} task start ${task.id} --force`);
+    return 0;
+  }
+  if (!JSON_OUT) {
+    note(`启动 Worker：${runner.command} ${runner.args.map(shellQuote).join(' ')}`);
+    note('');
+  }
+  // --json：CLI 自己的输出全部走 stderr，stdout 只留一行机器可读结果
+  const stdio = JSON_OUT ? ['inherit', 2, 2] : 'inherit';
+  const res = spawnSync(runner.command, runner.args, { cwd: task.worktree, stdio, env: process.env });
+  if (res.error) {
+    if (JSON_OUT) {
+      note(JSON.stringify({ started: false, reason: 'spawn-failed', code: res.error.code || '', message: res.error.message, command: runner.command, args: runner.args, ...base }, null, 2));
+      return 1;
+    }
+    note('');
+    note(`Worker 启动失败：${res.error.code || 'ERROR'} ${res.error.message}`);
+    note('（可执行文件存在但无法执行：检查执行权限 / 解释器 / 平台差异；也可在 .agents/config/agents.json 声明可用的启动模板）');
+    return 1;
+  }
+  if (JSON_OUT) {
+    note(JSON.stringify({ started: true, command: runner.command, args: runner.args, exit_code: res.status, ...base }, null, 2));
+  }
   return res.status === null ? 1 : res.status;
+}
+
+// Windows 上 Node 自 CVE-2024-27980 修复起禁止「不带 shell 直接 spawn 批处理」（抛 EINVAL）。
+// agentctl 不代拼 shell 引号：args 里含用户可控的标题/需求文本，转义写错就是命令注入；
+// 改为明确指引，把包装方式交给项目配置。
+function windowsBatchRunner(runner) {
+  if (process.platform !== 'win32') return '';
+  const p = runner.path || runner.command || '';
+  return /\.(cmd|bat)$/i.test(p) ? p : '';
 }
 
 function shellQuote(s) {
@@ -1392,7 +1628,10 @@ function taskForWorktree(wt) {
 // ============================ task list / show / current ============================
 
 function cmdTaskList(argv) {
-  const { vals } = parseFlags(argv, { value: ['--platform', '--agent', '--status', '--feature'] });
+  const { vals, flags } = parseFlags(argv, {
+    value: ['--platform', '--agent', '--status', '--feature'],
+    bool: ['--live'],
+  });
   const filt = {
     platform: vals['--platform'] || '',
     agent: vals['--agent'] || '',
@@ -1405,16 +1644,50 @@ function cmdTaskList(argv) {
       && (!filt.agent || t.agent === filt.agent)
       && (!filt.status || t.status === filt.status)
       && (!filt.feature || (t.feature || '') === filt.feature));
+  const live = flags.has('--live');
 
   if (JSON_OUT) {
-    note(JSON.stringify(tasks.map(({ file, ...rest }) => rest), null, 2));
+    note(JSON.stringify(tasks.map((t) => {
+      const { file, ...rest } = t;
+      if (!live) return rest;
+      const l = taskLiveInfo(t);
+      return {
+        ...rest,
+        live_worktree: l.wtState,
+        commits_ahead: l.ahead,
+        merged: l.merged,
+        idle_seconds: ageSeconds(t.updated_at),
+      };
+    }), null, 2));
     return;
   }
   if (tasks.length === 0) {
     note('（无匹配任务）');
     return;
   }
-  printTable(['ID', 'PLATFORM', 'AGENT', 'STATUS'], tasks.map((t) => [t.id, t.platform, t.agent, t.status]));
+  if (live) {
+    printTable(
+      ['ID', 'PLATFORM', 'AGENT', 'STATUS', 'WT', 'AHEAD', 'MERGED', 'IDLE'],
+      tasks.map((t) => {
+        const l = taskLiveInfo(t);
+        return [
+          t.id,
+          t.platform,
+          t.agent,
+          t.status,
+          l.wtState,
+          String(l.ahead),
+          l.merged === 'no' ? '—' : l.merged,
+          humanDuration(ageMs(t.updated_at)),
+        ];
+      }),
+    );
+    return;
+  }
+  printTable(
+    ['ID', 'PLATFORM', 'AGENT', 'STATUS', 'WT'],
+    tasks.map((t) => [t.id, t.platform, t.agent, t.status, worktreeState(t.worktree)]),
+  );
 }
 
 function taskLiveInfo(task) {
@@ -1437,7 +1710,7 @@ function taskLiveInfo(task) {
 
 function printNext(task) {
   const map = {
-    created: `Next: ${SELF} task start ${task.id}（把 Worker 接到该任务）`,
+    created: `Next: 在任务 worktree 内开工（由主代理派子代理，或 ${SELF} task start ${task.id} 前台启动）`,
     active: `Next: 在任务 worktree 内完成开发并提交，然后 ${SELF} task finish ${task.id}`,
     ready: `Next: ${SELF} task merge-check ${task.id} → ${SELF} task integrate ${task.id}`,
     blocked: `Next: 解除阻塞后 ${SELF} task set-status ${task.id} active`,
@@ -1448,6 +1721,7 @@ function printNext(task) {
     cancelled: `Next: ${SELF} task remove ${task.id} --force（回收工作区与分支）`,
   };
   note(map[task.status] || `Next: 状态未知（${task.status}），检查任务元数据`);
+  if (task.status_note) note(`Note: ${task.status_note}`);
 }
 
 function cmdTaskShow(argv) {
@@ -1467,6 +1741,8 @@ function cmdTaskShow(argv) {
       merged: live.merged,
       task_context: taskContextPath(task.worktree),
       task_context_exists: isFile(taskContextPath(task.worktree)),
+      age_seconds: ageSeconds(task.created_at),
+      idle_seconds: ageSeconds(task.updated_at),
     }, null, 2));
     return;
   }
@@ -1480,10 +1756,11 @@ function cmdTaskShow(argv) {
   note(`Worktree:   ${task.worktree}`);
   note(`Base:       ${task.base_branch} @ ${(task.base_commit || '').slice(0, 8)}`);
   note(`Status:     ${task.status}`);
+  if (task.status_note) note(`Note:       ${task.status_note}`);
   note(`Feature:    ${task.feature || '—'}`);
   note(`Parent:     ${task.parent_task || '—'}`);
-  note(`Created:    ${task.created_at}`);
-  note(`Updated:    ${task.updated_at || '—'}`);
+  note(`Created:    ${task.created_at}　（age ${humanDuration(ageMs(task.created_at))}）`);
+  note(`Updated:    ${task.updated_at || '—'}　（idle ${humanDuration(ageMs(task.updated_at))}）`);
   if (task.finished_commit) note(`Finished:   ${task.finished_commit.slice(0, 8)}`);
   if (task.merged_into) note(`Merged:     ${(task.merged_commit || '').slice(0, 8)} → ${task.merged_into}`);
   note(`Check:      ${scopedCheckPreview(task) || '—'}　（finish 门禁：只跑相关用例）`);
@@ -1542,10 +1819,11 @@ function cmdTaskCheck(argv) {
 
   const changed = collectChanges(task.worktree, task.base_commit);
   const unexpected = scopeUnexpected(task.allowed_paths, changed);
-  const ok = unexpected.length === 0;
+  const indexFlags = indexManipulation(task.worktree);
+  const ok = unexpected.length === 0 && indexFlags.length === 0;
 
   if (JSON_OUT) {
-    note(JSON.stringify({ id: task.id, ok, allowed_paths: task.allowed_paths, changed, unexpected }, null, 2));
+    note(JSON.stringify({ id: task.id, ok, allowed_paths: task.allowed_paths, changed, unexpected, index_flags: indexFlags }, null, 2));
     process.exit(ok ? 0 : 1);
   }
 
@@ -1554,15 +1832,24 @@ function cmdTaskCheck(argv) {
     note('Allowed paths:');
     note(allowedBlock(task.allowed_paths));
     note(`Changed files: ${changed.length}`);
+    note(`Index flags: ${indexFlags.length}`);
     note('Result: OK — 改动均在 allowed_paths 内');
     return;
   }
 
-  process.stderr.write('ERROR:\nTask modified files outside allowed scope.\n\n');
-  process.stderr.write(`Task:\n  ${task.id}\n\n`);
-  process.stderr.write(`Allowed:\n${allowedBlock(task.allowed_paths)}\n\n`);
-  process.stderr.write(`Unexpected files:\n${unexpected.map((u) => `  ${u}`).join('\n')}\n\n`);
-  process.stderr.write(`Changed files (${changed.length}):\n${changed.map((c) => `  ${c}`).join('\n')}\n`);
+  if (indexFlags.length > 0) {
+    process.stderr.write('ERROR:\nTask worktree has git index flags that hide changes.\n\n');
+    process.stderr.write(`Index flags (${indexFlags.length}):\n${indexFlags.map((f) => `  ${f}`).join('\n')}\n\n`);
+    process.stderr.write('skip-worktree / assume-unchanged 让这些文件的状态对 status / diff 隐形，审计覆盖不到；\n');
+    process.stderr.write('还原标记后重跑：git update-index --no-skip-worktree | --no-assume-unchanged <文件>\n\n');
+  }
+  if (unexpected.length > 0) {
+    process.stderr.write('ERROR:\nTask modified files outside allowed scope.\n\n');
+    process.stderr.write(`Task:\n  ${task.id}\n\n`);
+    process.stderr.write(`Allowed:\n${allowedBlock(task.allowed_paths)}\n\n`);
+    process.stderr.write(`Unexpected files:\n${unexpected.map((u) => `  ${u}`).join('\n')}\n\n`);
+    process.stderr.write(`Changed files (${changed.length}):\n${changed.map((c) => `  ${c}`).join('\n')}\n`);
+  }
   process.exit(1);
 }
 
@@ -1580,6 +1867,20 @@ function cmdTaskDiff(argv) {
   if (flags.has('--name-only')) opts.push('--name-only');
 
   const base = git(['-C', task.worktree, 'diff', ...opts, `${task.base_commit}..HEAD`]);
+  if (JSON_OUT) {
+    const payload = {
+      id: task.id,
+      base_commit: task.base_commit,
+      options: { stat: flags.has('--stat'), name_only: flags.has('--name-only'), working: flags.has('--working') },
+      committed_diff: base.stdout,
+    };
+    if (flags.has('--working')) {
+      payload.working_diff = git(['-C', task.worktree, 'diff', ...opts, 'HEAD']).stdout;
+      payload.staged_diff = git(['-C', task.worktree, 'diff', '--cached', ...opts]).stdout;
+    }
+    note(JSON.stringify(payload, null, 2));
+    return;
+  }
   process.stdout.write(base.stdout);
   if (flags.has('--working')) {
     note('');
@@ -1605,8 +1906,8 @@ function cmdTaskFinish(argv) {
   const task = readTask(id);
   const failures = [];
 
-  note(`Task finish: ${task.id}`);
-  note('');
+  progress(`Task finish: ${task.id}`);
+  progress('');
 
   // [1/5] worktree 与分支
   let ok1 = true;
@@ -1624,23 +1925,27 @@ function cmdTaskFinish(argv) {
       failures.push(`任务 worktree 当前检出分支是 ${headRef}，期望 ${task.task_branch}`);
     }
   }
-  note(`  [1/5] worktree 与分支：${okFail(ok1)}`);
+  progress(`  [1/5] worktree 与分支：${okFail(ok1)}`);
 
-  // [2/5] 无未提交改动
+  // [2/5] 无未提交改动 + 索引标记审计（skip-worktree / assume-unchanged 会让改动对 status/diff 隐形）
   const dirty = isDir(task.worktree) && git(['-C', task.worktree, 'status', '--porcelain']).stdout.trim() !== '';
   if (dirty) failures.push('任务 worktree 存在未提交改动（含未跟踪文件）：agentctl 不会丢弃它们，请先提交或清理');
-  note(`  [2/5] 无未提交改动：${okFail(!dirty)}`);
+  const indexFlags = isDir(task.worktree) ? indexManipulation(task.worktree) : [];
+  for (const f of indexFlags) {
+    failures.push(`git 索引标记隐藏了改动：${f}（skip-worktree/assume-unchanged 让 status/diff 看不到它，审计无效）`);
+  }
+  progress(`  [2/5] worktree 干净（含索引标记审计）：${okFail(!dirty && indexFlags.length === 0)}`);
 
   // [3/5] 改动范围
   const changed = collectChanges(task.worktree, task.base_commit);
   const unexpected = scopeUnexpected(task.allowed_paths, changed);
   for (const u of unexpected) failures.push(`越界文件：${u}`);
-  note(`  [3/5] allowed_paths 范围（${changed.length} 个改动文件）：${okFail(unexpected.length === 0)}`);
+  progress(`  [3/5] allowed_paths 范围（${changed.length} 个改动文件）：${okFail(unexpected.length === 0)}`);
 
   // [4/5] 至少一个 commit
   const ahead = task.base_commit ? revListCount(`${task.base_commit}..refs/heads/${task.task_branch}`) : 0;
   if (ahead <= 0) failures.push(`任务分支相对 base（${(task.base_commit || '').slice(0, 8)}）没有任何 commit`);
-  note(`  [4/5] 提交数（base 之后）：${ahead}（${okFail(ahead > 0)}）`);
+  progress(`  [4/5] 提交数（base 之后）：${ahead}（${okFail(ahead > 0)}）`);
 
   // [5/5] 相关检查（scoped）：只跑与该任务改动相关的用例；全量检查由 Worker 自行判断
   let testState;
@@ -1661,9 +1966,9 @@ function cmdTaskFinish(argv) {
   }
   if (testCommand) {
     const timeoutSec = vals['--timeout'] !== undefined ? parseTimeoutArg(vals['--timeout']) : effectiveTestTimeout(task);
-    note(`  [5/5] 相关检查：${testCommand}${timeoutSec ? `（超时 ${timeoutSec}s）` : ''}`);
-    note('');
-    const spawnOpts = { cwd: task.worktree, stdio: 'inherit', env: process.env };
+    progress(`  [5/5] 相关检查：${testCommand}${timeoutSec ? `（超时 ${timeoutSec}s）` : ''}`);
+    progress('');
+    const spawnOpts = { cwd: task.worktree, stdio: JSON_OUT ? ['inherit', 2, 2] : 'inherit', env: process.env };
     if (timeoutSec) {
       spawnOpts.timeout = timeoutSec * 1000;
       spawnOpts.killSignal = 'SIGTERM';
@@ -1675,7 +1980,7 @@ function cmdTaskFinish(argv) {
     const res = spawnSync(runner.cmd, runner.args, spawnOpts);
     const timedOut = Boolean(timeoutSec) && Boolean(res.error) && res.error.code === 'ETIMEDOUT';
     const rc = res.status === null ? 1 : res.status;
-    note('');
+    progress('');
     if (timedOut) {
       testState = `FAIL（${testCommand}，超时 ${timeoutSec}s 被终止）`;
       failures.push(`相关检查超时（${timeoutSec}s）：${testCommand}`);
@@ -1686,10 +1991,14 @@ function cmdTaskFinish(argv) {
       failures.push(`相关检查未通过：${testCommand}（退出码 ${rc}）`);
     }
   }
-  note(`  [5/5] 相关检查：${testState}`);
-  note('');
+  progress(`  [5/5] 相关检查：${testState}`);
+  progress('');
 
   if (failures.length > 0) {
+    if (JSON_OUT) {
+      note(JSON.stringify({ id: task.id, ok: false, status: task.status, failures }, null, 2));
+      process.exit(1);
+    }
     process.stderr.write('ERROR:\nfinish 被拒绝：未修改任何文件、未丢弃任何改动。\n\n');
     process.stderr.write(`Failures:\n${failures.map((f) => `  ${f}`).join('\n')}\n`);
     process.exit(1);
@@ -1749,6 +2058,11 @@ function cmdTaskSetStatus(argv) {
   if (!STATUSES.includes(status)) die(`非法状态：${status}（合法值：${STATUSES.join(' / ')}）`);
   const task = readTask(id);
   const updated = updateTask(id, { status, status_note: vals['--note'] || null });
+  if (JSON_OUT) {
+    const { file, ...rest } = updated;
+    note(JSON.stringify({ ...rest, previous_status: task.status }, null, 2));
+    return;
+  }
   note(`任务 ${task.id} 状态：${task.status} → ${updated.status}${vals['--note'] ? `（${vals['--note']}）` : ''}`);
 }
 
@@ -1959,7 +2273,6 @@ function cmdTaskAdopt(argv) {
     base_commit: baseCommit,
     task_branch: taskBranch,
     worktree: cwd,
-    worktree_rel: relToRoot(cwd),
     status,
     allowed_paths: allowed,
     feature: null,
@@ -2004,7 +2317,7 @@ function cmdTaskAdopt(argv) {
 // ============================ task start ============================
 
 function cmdTaskStart(argv) {
-  const { flags, positional } = parseFlags(argv, { bool: ['--dry-run'] });
+  const { flags, positional } = parseFlags(argv, { bool: ['--dry-run', '--force'] });
   const id = positional[0];
   if (!id) usageError('task start 需要 task id');
   const task = readTask(id);
@@ -2017,7 +2330,7 @@ function cmdTaskStart(argv) {
   const prevDryRun = DRY_RUN;
   if (flags.has('--dry-run')) DRY_RUN = true;
   try {
-    const rc = startWorker(task, runner);
+    const rc = startWorker(task, runner, { force: flags.has('--force') });
     if (rc !== 0) process.exit(rc);
   } finally {
     DRY_RUN = prevDryRun;
@@ -2210,13 +2523,17 @@ function cmdTaskIntegrate(argv) {
     const unmerged = unmergedPaths(ROOT);
     if (unmerged.length > 0) {
       updateTask(task.id, { status: 'conflict' });
+      if (JSON_OUT) {
+        note(JSON.stringify({ id: task.id, merged: false, status: 'conflict', into: row.branch, branch: task.task_branch, conflicts: unmerged }, null, 2));
+        process.exit(1);
+      }
       note(`Merge 仍在进行中（${task.task_branch} → ${row.branch}），以下文件冲突尚未解决：`);
       note(unmerged.map((f) => `  ${f}`).join('\n'));
       note('');
       note(`解决后：cd ${ROOT} && git add <files>，再执行 ${SELF} task integrate ${task.id} 收尾。`);
       process.exit(1);
     }
-    note('冲突已解决，收尾合并提交…');
+    progress('冲突已解决，收尾合并提交…');
     updateTask(task.id, { status: 'integrating' });
     const commit = git(['-C', ROOT, 'commit', ...mergeMsg]);
     if (commit.status !== 0) {
@@ -2225,7 +2542,7 @@ function cmdTaskIntegrate(argv) {
     }
   } else {
     platformCleanOrDie(row);
-    note(`Integrating: ${task.task_branch} → ${row.branch}（${relToRoot(ROOT)}）`);
+    progress(`Integrating: ${task.task_branch} → ${row.branch}（${relToRoot(ROOT)}）`);
     updateTask(task.id, { status: 'integrating' });
     const res = git(['-C', ROOT, 'merge', '--no-ff', ...mergeMsg, task.task_branch]);
     if (res.status !== 0) {
@@ -2235,6 +2552,10 @@ function cmdTaskIntegrate(argv) {
       const conflicted = mergeInProgress(ROOT) ? unmergedPaths(ROOT) : [];
       if (conflicted.length > 0) {
         updateTask(task.id, { status: 'conflict' });
+        if (JSON_OUT) {
+          note(JSON.stringify({ id: task.id, merged: false, status: 'conflict', into: row.branch, branch: task.task_branch, conflicts: conflicted, git_output: gitFailureDetail(res) }, null, 2));
+          process.exit(1);
+        }
         note('');
         note('Merge CONFLICT：主 checkout 中保留了进行中的 merge（未回退、未丢弃任何内容）。');
         note('');
@@ -2267,6 +2588,10 @@ function cmdTaskIntegrate(argv) {
   });
 
   note('');
+  if (JSON_OUT) {
+    note(JSON.stringify({ id: task.id, merged: true, status: 'merged', into: row.branch, commit: head }, null, 2));
+    return;
+  }
   note(`Task ${task.id} 已并入 ${row.branch}（${head.slice(0, 8)}）。`);
   note(`主干 main：${ROOT} —— 后续由主干上的测试 / 评审流程处理。`);
   note('');
@@ -2288,7 +2613,7 @@ function cmdTaskRemove(argv) {
   const pb = platformBranchLookup(task.platform);
   const mergedLive = Boolean(pb) && branchExists(task.task_branch) && branchExists(pb) && isAncestor(task.task_branch, pb);
   if (task.status !== 'merged' && mergedLive) {
-    note(`任务状态 ${task.status}，但分支已并入 ${pb}（注册表外的手工合并）：放行回收。`);
+    progress(`任务状态 ${task.status}，但分支已并入 ${pb}（注册表外的手工合并）：放行回收。`);
   }
   if (task.status !== 'merged' && !mergedLive && !force) {
     die(`任务未并入平台分支（status: ${task.status}），拒绝删除。如确认丢弃该任务与其分支，使用：agentctl task remove ${task.id} --force`);
@@ -2308,11 +2633,11 @@ function cmdTaskRemove(argv) {
   }
 
   if (wtState === 'missing') {
-    note(`任务 worktree 已不存在：${task.worktree}（跳过 worktree 回收）`);
+    progress(`任务 worktree 已不存在：${task.worktree}（跳过 worktree 回收）`);
   } else {
     const rm = git(['-C', ROOT, 'worktree', 'remove', ...(force ? ['--force'] : []), task.worktree]);
     if (rm.status !== 0) die(`worktree 回收失败：${task.worktree}\n${(rm.stderr || '').trim()}${force ? '' : '（可用 --force）'}`);
-    note(`已回收 worktree：${task.worktree}`);
+    progress(`已回收 worktree：${task.worktree}`);
   }
 
   if (branchExists(task.task_branch)) {
@@ -2322,11 +2647,25 @@ function cmdTaskRemove(argv) {
     if (!mergedLive) warn(`分支 ${task.task_branch} 未确认并入 ${pb || '平台分支'}，按 --force 强删`);
     const del = git(['-C', ROOT, 'branch', '-D', task.task_branch]);
     if (del.status !== 0) die(`分支删除失败：${task.task_branch}\n${(del.stderr || '').trim()}`);
-    note(`已删除分支：${task.task_branch}`);
+    progress(`已删除分支：${task.task_branch}`);
   }
 
-  fs.rmSync(task.file, { force: true });
-  note(`已删除任务记录：${task.file}`);
+  const record = task.file;
+  fs.rmSync(record, { force: true });
+  if (JSON_OUT) {
+    note(JSON.stringify({
+      id: task.id,
+      removed: true,
+      forced: force,
+      merged_live: mergedLive,
+      worktree: task.worktree,
+      worktree_removed: wtState !== 'missing',
+      branch: task.task_branch,
+      record,
+    }, null, 2));
+    return;
+  }
+  note(`已删除任务记录：${record}`);
 }
 
 // ============================ doctor ============================
@@ -2348,6 +2687,8 @@ function cmdDoctor(argv) {
   const platforms = buildPlatforms();
   add('Platform paths', platforms.length > 0 && platforms.every((r) => r.state === 'ok'),
     platforms.length ? `${platforms.filter((r) => r.state === 'ok').length}/${platforms.length} 目录就绪` : '未在 platforms.json 声明任何平台');
+  add('Platform config keys', CONFIG_WARNINGS.length === 0,
+    CONFIG_WARNINGS.length ? CONFIG_WARNINGS.join('；') : '平台配置无未生效键');
 
   const tasks = listTasks().map((id) => readTask(id));
   const byStatus = {};
@@ -2387,6 +2728,17 @@ function cmdDoctor(argv) {
   const detectedAgents = agentRows.filter((r) => r.detected).map((r) => r.name);
   add('Agent executables', detectedAgents.length > 0,
     agentRows.map((r) => `${r.name}: ${r.detected ? 'detected' : 'not found'}`).join('　'));
+  // 内置模板的启动参数只在 tested 版本上实测过：本机版本不同就要有人复核参数（不阻塞，只提示）
+  const drifted = agentRows
+    .filter((r) => r.detected && BUILTIN_RUNNERS[r.name] && BUILTIN_RUNNERS[r.name].tested)
+    .map((r) => {
+      const tested = BUILTIN_RUNNERS[r.name].tested;
+      const v = runnerVersion(r);
+      return v && v !== tested ? `${r.name}: 模板基于 ${tested} 实测，本机 ${v}（启动参数需复核）` : '';
+    })
+    .filter(Boolean);
+  add('Agent template versions', drifted.length === 0,
+    drifted.length ? drifted.join('；') : '模板实测版本与本机一致（未安装的 CLI 不检查）');
 
   const agentsMd = isFile(path.join(ROOT, 'AGENTS.md'));
   add('AGENTS.md', agentsMd, agentsMd ? path.join(ROOT, 'AGENTS.md') : '缺少 AGENTS.md');
@@ -2441,6 +2793,7 @@ function cmdHelp() {
 
 用法：
   agentctl [-C <目录>] [--json] <命令> [参数]
+      --json：每条命令输出一份机器可读 JSON（英文键名，稳定）；步骤进度与 CLI 自身输出改走 stderr
 
 自检：
   agentctl init                      项目内初始化：补 .gitignore 排除项（幂等不覆盖）
@@ -2469,14 +2822,23 @@ function cmdHelp() {
         --timeout <秒>             finish 相关检查超时秒数（默认取平台 test_timeout）
         --allow-overlap            与已有任务 scope 重叠时仍创建（显式确认）
         --dry-run                  只打印将创建的内容
-        --start                    创建后立即启动 Worker（不可用时降级为打印命令）
-  agentctl task list [--platform <p>] [--agent <a>] [--status <s>] [--feature <f>]
+        --start                    创建后立即启动 Worker（不可用时降级为打印命令；在 agent 会话内
+                                   默认降级为「派子代理」指引，--force 才嵌套启动）
+  agentctl task list [--platform <p>] [--agent <a>] [--status <s>] [--feature <f>] [--live]
+      默认附 WT（worktree 状态）；--live 再附 AHEAD / MERGED / IDLE（每条任务多跑几次 git，
+      并行任务盘点用）；--live --json 里为 live_worktree / commits_ahead / merged / idle_seconds
   agentctl task show <id>
-  agentctl task start <id> [--dry-run]      按 AgentRunner 启动 Worker
-  agentctl task check <id>                  校验实际改动是否越出 allowed_paths（越界退出码 1）
+  agentctl task start <id> [--dry-run] [--force]
+      按 AgentRunner 启动 Worker（工作目录 = 任务 worktree；--dry-run 只打印将执行的命令）。
+      在 agent 会话内默认降级为「派子代理进任务 worktree」指引——嵌套启动的 CLI 脱离本会话，
+      本会话收不到它的中间状态与结果，超时被杀还会留下零提交的僵尸任务；--force 才真的嵌套启动。
+  agentctl task check <id>                  校验改动是否越出 allowed_paths；同时审计 skip-worktree /
+                                            assume-unchanged 索引标记（它们会让改动对 status/diff 隐形）
+                                            越界或存在索引标记 → 退出码 1
   agentctl task diff <id> [--stat|--name-only] [--working]
   agentctl task finish <id> [--no-test] [--test-command '<cmd>'] [--test-filter <选择子>] [--timeout <秒>]
-      门禁：worktree 与分支正确、无未提交改动、改动未越界、至少一个 commit、相关检查通过。
+      门禁：worktree 与分支正确、无未提交改动且无隐藏改动的索引标记、改动未越界、至少一个 commit、
+      相关检查通过。
       相关检查只跑与该任务改动相关的用例（平台 test_command 模板 + {filter}/{files} 占位符：
       后端 = php artisan test --filter="…"，前端 = 对改动文件跑 eslint；选择子可用
       --test-filter 覆盖，否则由改动命中平台 test_globs 的文件推导）。
@@ -2494,6 +2856,7 @@ function cmdHelp() {
 
 约定：
   · main 是唯一集成边界；agent 开发一律在任务 worktree 内，分支从 main 切出、合并回 main。
+  · agent 会话内不嵌套启动 CLI：Worker 由主代理派子代理进任务 worktree（权威入口 .agents/TASK.md）。
   · .agents/tasks/*.json 为运行时状态（不入库）；注册表读改写走锁 + 原子替换。
   · 不做文件锁：覆盖由 worktree 隔离，逻辑冲突交 Git 合并。
   · 在仓库主 checkout 或其任意 worktree 内均可运行（-C 指定目录）。`);

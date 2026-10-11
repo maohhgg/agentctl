@@ -7,7 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`task list` shows live state.** The table gained a `WT` column (worktree
+  clean / dirty / missing); `--live` adds `AHEAD / MERGED / IDLE` (and
+  `live_worktree / commits_ahead / merged / idle_seconds` under `--json`), so a
+  coordinator can see who is stuck, who has zero commits and whose worktree is
+  dirty without running `task show` once per task.
+- **`task show` and `Next:` surface `status_note`, age and idle time.** The
+  `--note` recorded by `task set-status` used to be reachable only through
+  `--json`; it is now printed in the human output, together with how long ago the
+  task was created (`age`) and last updated (`idle`). `--json` gained
+  `age_seconds` / `idle_seconds`.
+- **`--json` on every state-changing command.** `task create` (including
+  `--dry-run`), `task start`, `task diff`, `task set-status`, `task finish`,
+  `task integrate` and `task remove` now emit a single machine-readable result —
+  including `conflicts` on integrate conflicts and `failures` on a rejected
+  finish. Progress lines and the CLI's own output go to stderr, so stdout parses
+  as one JSON document.
+- **Git index flags are audited before a task is accepted as clean.**
+  `task check` and the worktree gate of `task finish` now refuse a worktree where
+  `skip-worktree` / `assume-unchanged` hides files: those flags make real (and
+  out-of-scope) changes invisible to `status` and `diff`, so the scope audit
+  passed silently.
+- **`doctor` reports ineffective config keys and template drift.** Keys in
+  `.agents/config/platforms.json` that do not take effect are listed instead of
+  being silently ignored (a leftover per-platform `branch` is called out
+  explicitly) — `platform list` warns about them too. `doctor` also compares each
+  built-in runner template's tested version against the installed CLI
+  (`Agent template versions`).
+
+### Removed
+
+- Dead code and dead data: the `detectPlatforms()` stub (no caller since the
+  monorepo model), the never-read `worktree_rel` task field, and the unused
+  `spawn` import.
+
 ### Changed
+
+- **`--force`** for `task start` (and for `task create --start`): restores
+  nest-launching a CLI from inside an agent session (see below).
+- **The `opencode` runner template was corrected against a real install.**
+  `opencode` 1.18.34 has no `--dir` flag; the template is now
+  `opencode run <prompt>` — the working directory comes from the spawn cwd, which
+  agentctl already sets to the task worktree.
+- **Windows batch wrappers are refused with a reason instead of failing
+  obscurely.** Node refuses to spawn a `.cmd` / `.bat` without a shell since the
+  CVE-2024-27980 fix (EINVAL); `task start` now explains that and prints the two
+  workable paths (run the CLI in this session, or declare a `cmd.exe` wrapper in
+  `.agents/config/agents.json`) instead of exiting with a bare code.
+- **Spawn failures report their cause.** `res.error` (EACCES / ENOENT / EINVAL…)
+  is printed instead of only returning the exit code.
+- **`task start` no longer nest-launches a CLI from inside an agent session.**
+  When the caller is an agent CLI itself (`AGENTCTL_AGENT` set, or the calling
+  CLI found in the process ancestry), `task start` prints how to dispatch a
+  subagent into the printed task worktree instead of `spawnSync`-ing another
+  CLI. A nested CLI leaves the calling session: that session never sees its
+  progress or results, and a killed timeout leaves an `active` task with zero
+  commits. `task create` follows the same rule — inside an agent session its
+  `Start Worker:` block recommends the subagent path instead of `task start`.
+  Plain terminals are unchanged; `--force` restores the previous behavior.
 
 - **Merge commits now carry only a subject line.** `task integrate` used to
   append a five-line body — `Task: <id>（agent <name>）`, `分支：<branch> → <main>`,
@@ -29,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed registry operation no longer poisons the lock.** `die()` exits via
+  `process.exit()`, which does not unwind the stack, so the old `finally`-only
+  release left `.agents/state/locks/registry.lock` behind after any failure
+  inside the critical section ("task already exists", invalid `--type`, a failed
+  `git worktree add`…). Every later write command then spun for 15s and blamed
+  another process, and nothing ever reclaimed it. Release now also runs from an
+  `exit` handler, reclaiming is limited to a lock whose recorded holder is dead,
+  and release verifies its own token first — so a live lock is never stolen and a
+  holder that exits never deletes someone else's lock. The reclaim and timeout
+  thresholds no longer contradict each other, and the timeout message names the
+  holder plus whether that process is still alive.
 - **`task integrate` no longer misreports non-conflict merge failures as
   conflicts**: when `git merge` failed for any reason, `MERGE_HEAD` is
   present, so the old code took the conflict branch and printed an empty
@@ -41,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Merge failure messages now carry git's actual output** instead of only
   pointing at `git status`, on all three merge-related failure paths (initial
   merge, non-conflict failure, and the follow-up merge commit).
+- **Agent self-identification no longer reads agentctl's own command line.**
+  The process-ancestry scan started at the agentctl process itself, so
+  `agentctl task create --agent omp …` (or any name declared in
+  `.agents/config/agents.json`) matched its own `--agent` argument and reported
+  "inside an omp session". The scan now starts at the parent process.
 
 ## [0.0.3] - 2026-09-19
 

@@ -124,7 +124,9 @@ agentctl task create --platform backend --agent codex \
   --requirements "login endpoint;callback;token refresh;tests" \
   --allowed-paths 'src/auth/**,tests/auth/**'
 
-# 交给 agent——让 agentctl 直接启动：
+# 交给 agent：在 agent 会话内派子代理进该任务 worktree（权威入口 = 该目录下的 .agents/TASK.md）
+#   ../my-repo-agent-worktrees/backend/backend-google-oauth-001
+# 普通终端里可让 agentctl 直接启动 CLI：
 agentctl task start backend-google-oauth-001
 # …或自己进任务 worktree 手工启动：
 cd ../my-repo-agent-worktrees/backend/backend-google-oauth-001 && codex
@@ -152,12 +154,14 @@ agentctl task remove backend-google-oauth-001       # 评审后回收 worktree �
 - 否则 → 你是 **Coordinator**。
 
 ### Coordinator（仓库根 / 平台 worktree）
-1. `agentctl platform list` 与 `agentctl task list --json`——定平台、
-   查在途任务与 scope 重叠。
+1. `agentctl platform list` 与 `agentctl task list --json --live`——定平台，
+   查在途任务的实时状态（worktree 脏否、领先提交数、闲置时长）与 scope 重叠。
 2. `agentctl task create --platform <p> --agent <cli> --title '…' \
       --requirements 'a;b;c' --allowed-paths '<globs>'`
    （`--agent` 可省略——agentctl 会自识别当前 CLI；在 agent 会话内直接省略即可。）
-3. `agentctl task start <id>` 启动 worker（或按打印的目录手工启动 agent CLI）。
+3. agent 会话内：派子代理进打印出的任务 worktree（权威入口 `.agents/TASK.md`）——
+   嵌套启动的 CLI 脱离本会话，进展与结果都回不来。`agentctl task start <id>` 供普通终端
+   启动 worker CLI；在 agent 会话内它打印同样的派子代理指引，要嵌套启动加 `--force`。
 4. 平台分支期间前进了：`agentctl task update-base <id>`。
 5. 评审后：`agentctl task merge-check <id>` → `agentctl task integrate <id>`
    → `agentctl task remove <id>`。
@@ -184,17 +188,17 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 
 | 命令 | 说明 |
 |---|---|
-| `init` | 一次性初始化：按探测平台生成 `platforms.json`、补 `.gitignore` 排除（幂等，绝不覆盖） |
+| `init` | 一次性初始化：补 `.gitignore` 排除项（幂等，绝不覆盖）；平台范围由 `platforms.json` 人工声明 |
 | `whoami` | 查看当前会话的 agent 自识别结果 |
-| `doctor` | 自检：git / 仓库 / worktree / 注册表 / agent CLI / 当前模式 |
+| `doctor` | 自检：git / 仓库 / worktree / 注册表 / agent CLI（含与模板实测版本的漂移）/ 平台配置键 / 当前模式 |
 | `agent list` | Agent runner 与本机检测结果 |
-| `platform list` | 平台注册表（探测 + 声明）、状态与别名 |
+| `platform list` | 已声明的平台范围、状态与别名（不生效的配置键会告警） |
 | `task current` | 当前目录是 Coordinator 还是 Worker 模式 |
 | `task create` | 新任务：分支 + worktree + `.agents/TASK.md` + 注册表记录 |
-| `task list` | 按 `--platform / --agent / --status / --feature` 过滤 |
-| `task show <id>` | 完整元数据 + 实时状态（脏 / 领先 / 已并入） |
-| `task start <id>` | 在任务 worktree 内启动 agent CLI |
-| `task check <id>` | 范围审计——越界退出码 1 |
+| `task list` | 按 `--platform / --agent / --status / --feature` 过滤；表格恒带 WT（worktree 状态），`--live` 再附领先提交数 / 已并入 / 闲置时长 |
+| `task show <id>` | 完整元数据 + 实时状态（脏 / 领先 / 已并入）+ `status_note` + age / idle |
+| `task start <id>` | 在任务 worktree 内启动 agent CLI；在 agent 会话内改为打印派子代理指引（`--force` 才嵌套启动，`--dry-run` 只打印命令） |
+| `task check <id>` | 范围审计——越界、或存在隐藏改动的 `skip-worktree` / `assume-unchanged` 标记时退出码 1 |
 | `task diff <id>` | 相对 base 的差异（`--stat` / `--name-only` / `--working`） |
 | `task finish <id>` | 五项门禁 → 状态 `ready`；`--no-test` / `--test-command` / `--timeout` |
 | `task update-base <id>` | 把平台分支新提交合并进任务分支并刷新基点（冲突安全，`--dry-run`） |
@@ -204,7 +208,7 @@ agentctl [-C <目录>] [--json] <命令> [参数]
 | `task integrate <id>` | `--no-ff` 并入平台分支；冲突可续做 |
 | `task remove <id>` | 回收 worktree + 分支 + 记录（仅 merged + 干净） |
 
-所有命令支持全局 `--json` 输出机器可读结果。
+所有命令支持全局 `--json`：每条命令 stdout 只给一份 JSON，步骤进度与 CLI 自身输出改走 stderr。
 
 ### 任务状态机
 
@@ -253,9 +257,14 @@ created ──► active ──finish（5 门禁）──► ready ──integra
 }
 ```
 
-内置模板只收录本机实测过参数的 CLI（`omp` 18.2.5、`opencode`）。其他
-agent CLI 请按上面声明——或者不声明，`task start` 会打印手工启动命令。
-此处声明的键名同时加入 `--agent` 自识别的已知名字集。
+内置模板只收录实测过参数的 CLI（`omp` 18.8.9、`opencode` 1.18.34）；`doctor`
+会比对本机版本与模板实测版本，不一致时提示复核。其他 agent CLI 请按上面声明——
+或者不声明，`task start` 会打印手工启动命令。此处声明的键名同时加入
+`--agent` 自识别的已知名字集。
+
+`task start` 面向普通终端。在 agent CLI 会话内调用（`AGENTCTL_AGENT` 已设置，
+或进程链中识别出调用方 CLI）时，它打印「派子代理」指引而不嵌套启动 CLI——
+嵌套的 CLI 脱离调用方会话，进展与结果都回不来；`--force` 可覆盖该行为。
 
 任务记录在 `.agents/tasks/<id>.json`、运行时产物在 `.agents/state/`——都是
 运行时状态。`agentctl init` 会自动补 `.gitignore` 排除项，`doctor` 负责检查。

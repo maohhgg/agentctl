@@ -137,7 +137,10 @@ agentctl task create --platform backend --agent codex \
   --requirements "login endpoint;callback;token refresh;tests" \
   --allowed-paths 'src/auth/**,tests/auth/**'
 
-# hand it to the agent — either let agentctl launch it:
+# hand it to the agent. Inside an agent session, dispatch a subagent into the
+# printed task worktree — the authoritative entrypoint is that dir's .agents/TASK.md:
+#   ../my-repo-agent-worktrees/backend/backend-google-oauth-001
+# From a plain terminal, either let agentctl launch the CLI:
 agentctl task start backend-google-oauth-001
 # …or run the CLI yourself inside the printed task worktree:
 cd ../my-repo-agent-worktrees/backend/backend-google-oauth-001 && codex
@@ -167,14 +170,19 @@ Decide your role with `agentctl task current`:
 - Otherwise → you are the **Coordinator**.
 
 ### Coordinator (repo root / platform worktrees)
-1. `agentctl platform list` and `agentctl task list --json` — pick the platform,
-   check in-flight tasks and scope overlaps.
+1. `agentctl platform list` and `agentctl task list --json --live` — pick the
+   platform, then check in-flight tasks (live worktree state, commits ahead,
+   idle time) and scope overlaps before creating another one.
 2. `agentctl task create --platform <p> --agent <cli> --title '…' \
       --requirements 'a;b;c' --allowed-paths '<globs>'`
    (`--agent` is optional — agentctl self-identifies the calling CLI; when
    inside an agent session, just omit it.)
-3. `agentctl task start <id>` to launch the worker (or open the agent CLI in the
-   printed worktree).
+3. Inside an agent session, dispatch a subagent into the printed task worktree
+   (`.agents/TASK.md` is its authoritative entrypoint) — a nested CLI would
+   leave the session, so its progress and results never come back.
+   `agentctl task start <id>` launches the worker CLI from a plain terminal;
+   inside an agent session it prints that same subagent guidance unless you pass
+   `--force`.
 4. If the platform branch moved meanwhile: `agentctl task update-base <id>`.
 5. After review: `agentctl task merge-check <id>` → `agentctl task integrate <id>`
    → `agentctl task remove <id>`.
@@ -201,17 +209,17 @@ agentctl [-C <dir>] [--json] <command> [args]
 
 | Command | Purpose |
 |---|---|
-| `init` | One-time setup: generate `platforms.json` from detected worktrees, add `.gitignore` entries (idempotent, never overwrites) |
+| `init` | One-time setup: add the `.gitignore` exclusions (idempotent, never overwrites); platform ranges are declared by hand in `platforms.json` |
 | `whoami` | Show which agent name would be self-identified in this session |
-| `doctor` | Self-check: git, repo, worktrees, registry, agent CLIs, mode |
+| `doctor` | Self-check: git, repo, worktrees, registry, agent CLIs (+ version drift vs the tested template), platform config keys, mode |
 | `agent list` | Agent runners and whether they're detected on PATH |
-| `platform list` | Platform registry (auto-detected + declared), state and aliases |
+| `platform list` | Declared platform ranges, state and aliases (warns about config keys that don't take effect) |
 | `task current` | Coordinator or Worker mode for the current directory |
 | `task create` | New task: branch + worktree + `.agents/TASK.md` + registry record |
-| `task list` | Filter by `--platform / --agent / --status / --feature` |
-| `task show <id>` | Full metadata + live state (dirty, ahead, merged) |
-| `task start <id>` | Launch the agent CLI inside the task worktree |
-| `task check <id>` | Scope audit — exit 1 if any changed file is out of scope |
+| `task list` | Filter by `--platform / --agent / --status / --feature`; the table always shows worktree state (`WT`), `--live` adds commits ahead / merged / idle |
+| `task show <id>` | Full metadata + live state (dirty, ahead, merged) + `status_note` + age / idle |
+| `task start <id>` | Launch the agent CLI inside the task worktree; inside an agent session prints subagent guidance instead (`--force` to nest-launch, `--dry-run` to print) |
+| `task check <id>` | Scope audit — exit 1 on out-of-scope files, or on `skip-worktree` / `assume-unchanged` flags that hide changes from `status` / `diff` |
 | `task diff <id>` | Diff vs base (`--stat`, `--name-only`, `--working` for uncommitted) |
 | `task finish <id>` | Five gates → status `ready`; `--no-test` / `--test-command` / `--timeout` |
 | `task update-base <id>` | Merge platform-branch new commits into the task branch and refresh its base (conflict-safe, `--dry-run`) |
@@ -221,7 +229,9 @@ agentctl [-C <dir>] [--json] <command> [args]
 | `task integrate <id>` | `--no-ff` merge into the platform branch; conflict-safe |
 | `task remove <id>` | Reclaim worktree + branch + record (merged + clean only) |
 
-Every command also emits machine-readable output with the global `--json` flag.
+Every command also emits machine-readable output with the global `--json` flag —
+one JSON document per stdout, with progress lines and the CLI's own output on
+stderr.
 
 ### Task lifecycle
 
@@ -272,9 +282,17 @@ verified built-in one; `{worktree}` and `{prompt}` are substituted):
 ```
 
 We ship built-in templates only for flags we verified against a real installed
-version (`omp` 18.2.5, `opencode`). For your own agent CLIs, declare them as
-above — or don't, and `task start` will print the manual command. Keys declared
-here also join the known-name set for `--agent` self-identification.
+version (`omp` 18.8.9, `opencode` 1.18.34); `doctor` reports when an installed
+CLI's version differs from the one its template was verified against. For your
+own agent CLIs, declare them as above — or don't, and `task start` will print the
+manual command. Keys declared here also join the known-name set for `--agent`
+self-identification.
+
+`task start` is meant for a plain terminal. Called from inside an agent CLI
+session (`AGENTCTL_AGENT` set, or the calling CLI detected in the process
+ancestry) it prints the dispatch-a-subagent guidance instead of nest-launching a
+CLI — a nested CLI leaves the calling session, so its progress and results never
+come back; `--force` overrides that.
 
 Task records live in `.agents/tasks/<id>.json` and runtime files in
 `.agents/state/` — both are runtime state. `agentctl init` adds the

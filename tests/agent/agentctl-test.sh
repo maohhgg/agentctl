@@ -4,12 +4,14 @@
 #
 # 覆盖：doctor 自检、平台目录声明（paths / 别名 / 缺失目录 / 歧义）、任务创建（显式 / 自动 task id
 # + <type>/<平台>-<slug> 任务分支 + 独立 worktree，含 --type 白名单校验）、TASK.md 任务上下文（含不进业务提交）、
-# allowed_paths 范围检查、scope 重叠检测、finish 门禁（相关检查收窄 {filter} / {files} 与超时）
-# 与 Worker 完成摘要、merge-check（只读）、integrate（在主 checkout 内并入 main，含冲突续做）、
+# allowed_paths 范围检查、索引标记审计（skip-worktree / assume-unchanged 隐藏改动）、注册表锁自愈与残留锁、
+# scope 重叠检测、finish 门禁（相关检查收窄 {filter} / {files} 与超时）与 Worker 完成摘要、
+# 可观测性（list 的 WT / --live / status_note / age / idle）与 --json 覆盖（含状态变更命令）、
+# merge-check（只读）、integrate（在主 checkout 内并入 main，含冲突续做）、
 # integrate 失败判据（无真实冲突时不得误报 CONFLICT、错误信息须带 git 原始输出）、
 # update-base（基点推进与冲突续做）、adopt（注册表重建）、手工合并放行回收、回收规则、
 # init（.gitignore 排除项 / 幂等 / 不代写平台配置）、agent 自识别（whoami / env / flag 优先级）、
-# 平台目录内建任务告警、AgentRunner（自动启动与降级），以及四个并发场景：
+# 平台目录内建任务告警、AgentRunner（自动启动与降级、agent 会话内不嵌套启动、--force），以及四个并发场景：
 #   Case 1 两个 agent 同时创建任务　Case 2 两个任务改同一文件互不覆盖
 #   Case 3 merge-check 发现 Git conflict　Case 4 scope 重叠被拦截
 #
@@ -68,6 +70,15 @@ assert_rc() { if [[ "$RC" == "$2" ]]; then pass "$1"; else fail "$1" "退出码 
 assert_rc_nonzero() { if [[ "$RC" != 0 ]]; then pass "$1"; else fail "$1" '退出码应为非 0'; fi; }
 assert_out_contains() { if [[ "$OUT" == *"$2"* ]]; then pass "$1"; else fail "$1" "stdout 未包含：$2"; fi; }
 assert_err_contains() { if [[ "$ERR" == *"$2"* ]]; then pass "$1"; else fail "$1" "stderr 未包含：$2"; fi; }
+
+# stdout 必须是可被 JSON.parse 的单一结果（--json 的契约）
+assert_out_json() {
+  if printf '%s' "$OUT" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"))' 2>/dev/null; then
+    pass "$1"
+  else
+    fail "$1" "stdout 不是合法 JSON：$(printf '%s' "$OUT" | head -2)"
+  fi
+}
 
 assert_file_content() {
   local d="$1" f="$2" e="$3"
@@ -524,6 +535,46 @@ assert_out_contains '降级路径给出手工启动命令' 'cd '
 run agent list
 assert_out_contains 'agent list 显示检测结果' 'opencode'
 
+# agent 会话内不嵌套启动 CLI（脱离本会话、产出无人验收）：降级为「派子代理」指引，--force 才嵌套启动
+cat >"$REPO/.agents/config/agents.json" <<'JSON'
+{
+  "probeagent": { "command": "true", "args": [] }
+}
+JSON
+run task create --platform backend --agent probeagent --task task-session --title 'Session Task' --allowed-paths 'apps/api/src/session/**'
+assert_rc '建任务（探针 agent）成功' 0
+# 本套件若在 agent 会话内运行，会话外分支不可达：条件断言而不是误报
+if "$AGENTCTL" whoami | grep -q '（未识别出已知 agent CLI）'; then
+  assert_out_contains '会话外仍以 task start 为首选' 'task start task-session'
+else
+  printf 'skip 会话外首选断言：当前处于 agent 会话内\n'
+fi
+AGENTCTL_AGENT=omp "$AGENTCTL" task create --platform backend --agent probeagent --task task-session2 --title 'Session Task 2' --allowed-paths 'apps/api/src/session2/**' >"$WORK/create-session.out" 2>&1
+grep -q '派子代理' "$WORK/create-session.out" &&
+  pass 'agent 会话内建任务输出派子代理指引' || fail 'agent 会话内建任务输出派子代理指引' "$(cat "$WORK/create-session.out")"
+if grep -q 'task start task-session2' "$WORK/create-session.out"; then
+  fail 'agent 会话内不再把 task start 作为首选' ''
+else
+  pass 'agent 会话内不再把 task start 作为首选'
+fi
+run task remove task-session2 --force
+AGENTCTL_AGENT=omp "$AGENTCTL" task start task-session >"$WORK/start-session.out" 2>&1
+if grep -q '会话内' "$WORK/start-session.out" && grep -q '子代理' "$WORK/start-session.out"; then
+  pass 'agent 会话内 task start 降级为派子代理指引'
+else
+  fail 'agent 会话内 task start 降级为派子代理指引' "$(cat "$WORK/start-session.out")"
+fi
+if grep -q '启动 Worker：true' "$WORK/start-session.out"; then
+  fail '降级路径不启动 CLI' ''
+else
+  pass '降级路径不启动 CLI'
+fi
+AGENTCTL_AGENT=omp "$AGENTCTL" task start task-session --force >"$WORK/start-force.out" 2>&1
+grep -q '启动 Worker：true' "$WORK/start-force.out" &&
+  pass '--force 才真的嵌套启动' || fail '--force 才真的嵌套启动' "$(cat "$WORK/start-force.out")"
+rm -f "$REPO/.agents/config/agents.json"
+run task remove task-session --force
+
 section '17. 回收规则（task remove）'
 run task remove task-z
 assert_rc_nonzero '未 merged → 拒绝删除'
@@ -912,12 +963,120 @@ run --json whoami
 assert_rc 'whoami --json 退出码 0' 0
 
 section '28. 任务分支 type 白名单（--type 校验）'
-# 放在最后：非法 --type 会在注册表临界区内 die，残留的锁会挡住后续所有注册表命令
+# 非法 --type 在注册表临界区内 die：这条同时验证「锁内 die 不留残留锁」（见下方断言）
 run task create --platform backend --agent codex --task task-bad-type --title 'Bad Type' --type nope
 assert_rc_nonzero '非法 --type → 拒绝创建'
 assert_err_contains '报错列出 type 白名单' '分支 type 不合法'
 assert_absent '非法 --type 不留下任务记录' "$REPO/.agents/tasks/task-bad-type.json"
 assert_absent '非法 --type 不留下任务分支' "$REPO/.git/refs/heads/nope/api-task-bad-type"
+
+# 上面这条 die 发生在注册表临界区内：die 路径不得留下残留锁（否则后续命令全被卡住）
+assert_absent '锁内 die 不残留注册表锁' "$REPO/.agents/state/locks/registry.lock"
+
+section '28.5. 锁自愈 / 索引标记审计 / 可观测性 / --json 输出'
+# 模拟「持有者进程已死」的残留锁：下一个命令应自动回收，而不是空转 15s 后失败
+mkdir -p "$REPO/.agents/state/locks/registry.lock"
+printf 'pid=999999\ntoken=stale\nat=2000-01-01T00:00:00.000Z\n' >"$REPO/.agents/state/locks/registry.lock/owner"
+touch -t 200001010000 "$REPO/.agents/state/locks/registry.lock"
+run task create --platform backend --agent codex --task task-opt --title 'Opt Task' --allowed-paths 'apps/api/src/opt/**'
+assert_rc '死进程残留锁被自动回收（命令照常成功）' 0
+assert_absent '回收后不再残留锁' "$REPO/.agents/state/locks/registry.lock"
+
+# 索引标记审计：skip-worktree 让越界改动对 status/diff 隐形，check 与 finish 必须拦下
+WOPT="$WTROOT/api/task-opt"
+g -C "$WOPT" update-index --skip-worktree apps/api/src/index.ts
+printf 'tampered\n' >>"$WOPT/apps/api/src/index.ts"
+run task check task-opt
+assert_rc_nonzero 'skip-worktree 隐藏的改动 → check 退出码非 0'
+assert_err_contains 'check 报出索引标记' 'index flags'
+run task finish task-opt --no-test
+assert_rc_nonzero '索引标记 → finish 被拒绝'
+assert_err_contains 'finish 失败原因含索引标记' '索引标记'
+g -C "$WOPT" update-index --no-skip-worktree apps/api/src/index.ts
+g -C "$WOPT" checkout -- apps/api/src/index.ts
+run task check task-opt
+assert_rc '还原标记与内容后 check 通过' 0
+
+# task list：默认附 WT，--live 附 AHEAD/MERGED/IDLE（按平台 id 过滤，别名不参与 list 过滤）
+run task list --platform api
+assert_out_contains 'task list 默认附 WT 列' 'WT'
+run task list --platform api --live
+assert_out_contains '--live 附 AHEAD 列' 'AHEAD'
+run --json task list --platform api --live
+assert_out_json '--live --json 是合法 JSON'
+assert_out_contains '--live --json 含 commits_ahead' '"commits_ahead"'
+
+# status_note 与 Age/Idle 必须出现在人类可读路径（不能只有 --json 拿得到）
+run task set-status task-opt active --note '等上游契约'
+assert_out_contains 'set-status 回显备注' '等上游契约'
+run task show task-opt
+assert_out_contains 'task show 显示 status_note' '等上游契约'
+assert_out_contains 'task show 显示 age' '（age '
+assert_out_contains 'task show 显示 idle' '（idle '
+
+# --json 覆盖：状态变更命令也要给机器可读结果
+run --json task create --platform backend --agent codex --task task-json --title 'Json Task' --allowed-paths 'apps/api/src/json/**'
+assert_out_json 'task create --json 是合法 JSON'
+run --json task diff task-json
+assert_out_json 'task diff --json 是合法 JSON'
+run --json task set-status task-json blocked --note '依赖'
+assert_out_json 'task set-status --json 是合法 JSON'
+run --json task finish task-json --no-test
+assert_rc_nonzero 'finish --json 门禁不过时退出码非 0'
+assert_out_json 'finish --json 失败结果仍是合法 JSON'
+assert_out_contains 'finish --json 带 failures' '"failures"'
+cat >"$REPO/.agents/config/agents.json" <<'JSON'
+{
+  "probeagent": { "command": "true", "args": [] }
+}
+JSON
+run task create --platform backend --agent probeagent --task task-probe --title 'Probe Task' --allowed-paths 'apps/api/src/probe/**'
+assert_rc '建 task-probe（探针 agent）' 0
+AGENTCTL_AGENT=omp "$AGENTCTL" task start task-probe --json >"$WORK/start-json.out" 2>&1
+if node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$WORK/start-json.out" 2>/dev/null; then
+  pass 'task start --json（会话内降级）是合法 JSON'
+else
+  fail 'task start --json（会话内降级）是合法 JSON' "$(cat "$WORK/start-json.out")"
+fi
+grep -q '"reason": "agent-session"' "$WORK/start-json.out" &&
+  pass 'start --json 报告降级原因' || fail 'start --json 报告降级原因' "$(cat "$WORK/start-json.out")"
+rm -f "$REPO/.agents/config/agents.json"
+run task remove task-probe --force
+assert_rc '清理 task-probe' 0
+
+# integrate / remove 的 JSON（先造一条能通过门禁的任务）
+run task create --platform backend --agent codex --task task-int --title 'Int Task' --allowed-paths 'apps/api/src/int/**'
+assert_rc '建 task-int' 0
+WINT="$WTROOT/api/task-int"
+mkdir -p "$WINT/apps/api/src/int"
+printf 'export const x = 1;\n' >"$WINT/apps/api/src/int/x.ts"
+g -C "$WINT" add apps/api/src/int/x.ts
+g -C "$WINT" commit -qm 'int change'
+run task finish task-int --no-test
+assert_rc 'task-int 通过 finish（--no-test）' 0
+# integrate 要求主 checkout 干净：把前面 section 改过的配置固化进 fixture（不丢内容）
+g add .gitignore .agents/config/platforms.json 2>/dev/null || true
+g commit -qm 'fixture: 固化配置改动' 2>/dev/null || true
+run --json task integrate task-int
+assert_rc 'task-int integrate 成功' 0
+assert_out_json 'task integrate --json 是合法 JSON'
+assert_out_contains 'integrate 结果含 merged: true' '"merged": true'
+run --json task remove task-int
+assert_out_json 'task remove --json 是合法 JSON'
+assert_out_contains 'remove 结果含 removed: true' '"removed": true'
+
+# 配置里不生效的键要告警（per-platform branch 曾被静默忽略）
+cp "$REPO/.agents/config/platforms.json" "$WORK/platforms.bak"
+printf '{"main_branch":"main","platforms":{"api":{"paths":["apps/api"],"branch":"develop","typo":1}}}\n' >"$REPO/.agents/config/platforms.json"
+run platform list
+assert_err_contains '失效配置键告警' '不生效'
+run doctor
+assert_out_contains 'doctor 报告配置键检查项' 'Platform config keys'
+assert_out_contains 'doctor 报告模板版本检查项' 'Agent template versions'
+cp "$WORK/platforms.bak" "$REPO/.agents/config/platforms.json"
+
+run task remove task-opt --force
+assert_rc '清理 task-opt' 0
 
 section '29. 结束'
 printf '\n通过 %d 项，失败 %d 项\n' "$PASS" "$FAILED"
